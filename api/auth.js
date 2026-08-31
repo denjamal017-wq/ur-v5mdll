@@ -161,7 +161,9 @@ async function register(res, b, req) {
     name,
     area,
     status: 'active',
-    pass_hash: passHash
+    pass_hash: passHash,
+    // نخزّن بصمة الجهاز من أول لحظة — أساس كشف التعامل الذاتي لاحقاً
+    devices: fraudCheck.deviceId ? [fraudCheck.deviceId] : []
   })
 
   // Record successful registration for IP and Device tracking
@@ -224,6 +226,10 @@ async function login(res, b, req) {
 
   const ok = await verifyPassword(pass, profile.pass_hash)
   if (!ok) return json(res, 401, { ok: false, error: 'bad_credentials' })
+
+  // نلحق بصمة الجهاز بكل دخول ناجح (آخر 10 أجهزة) — كشف التعامل الذاتي
+  const devs = Array.from(new Set([].concat(profile.devices || [], [deviceId]))).slice(-10)
+  try { await dal.update('ur_profiles', { id: profile.id }, { devices: devs }) } catch (_) {}
 
   const token = signToken({ sub: profile.id, role: profile.role, phone: profile.phone })
   return json(res, 200, { ok: true, token, userId: profile.id, role: profile.role })
