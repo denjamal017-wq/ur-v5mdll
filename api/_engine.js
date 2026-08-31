@@ -3,8 +3,8 @@
 //  Assembles the exact DB snapshot the frontend render code consumes,
 //  and applies every mutation with the exact same rules as the client.
 //  Uses ONLY dal.* so it runs identically in prod and in the offline test.
-//  v7.5 — إلغاء التوقف +24س · حارس سوء الإلغاء · revertToEstimate · نمط
-//  الاعتذارات · تنظيف السوق 48س · قياس الاستجابة · v7.4: ذرية CAS كاملة.
+//  v7.6 — مكافحة تواطؤ تنزيل الذمة: مرجع طلب إلزامي + تنبيه النمط المتكرر
+//  · v7.5: مكافحة الجمود ونظافة السوق · v7.4: ذرية CAS كاملة.
 // =====================================================================
 const { dal, hashPassword, verifyPassword, ENV } = require('./_lib')
 
@@ -636,7 +636,22 @@ async function runAction(actor, action, p) {
       forbid(isAdmin)
       const amount = parseInt(p.amount) || 0; need(amount !== 0, 'bad_price')
       const note = String(p.note || '').trim(); need(note.length >= 3, 'bad_body')
-      const nd = await applyDebt(p.userId, amount, 'adjustment', null, 'تعديل إداري: ' + note)
+      // مكافحة التواطؤ: تنزيل الذمة (قيمة سالبة) يتطلب رقم طلب مرجعي يخص نفس المقدم —
+      // وثاني تنزيل+ خلال 30 يوم → تنبيه «نمط تواطؤ محتمل» لباقي الإدارة قبل الاعتماد
+      let adjOrderId = null
+      if (amount < 0) {
+        adjOrderId = String(p.orderId || '').trim()
+        need(/^UR-\d+$/.test(adjOrderId), 'bad_body')
+        const refOrder = await getOrder(adjOrderId)
+        need(refOrder && refOrder.provider_id === p.userId, 'order_not_found')
+        const monthAgo = Date.now() - 30 * 86400000
+        const prevRed = (await dal.all('ur_ledger', { provider_id: p.userId, kind: 'adjustment' }))
+          .filter((l) => l.amount < 0 && toMs(l.created_at) > monthAgo).length
+        if (prevRed >= 1) {
+          await notifyAdmins('🚨', 'تنزيل ذمة متكرر لنفس المقدم خلال 30 يوم (' + (prevRed + 1) + ' مرة) — نمط تواطؤ محتمل: راجع الدفتر والمحادثات قبل أي اعتماد إضافي', null)
+        }
+      }
+      const nd = await applyDebt(p.userId, amount, 'adjustment', adjOrderId, 'تعديل إداري: ' + note)
       await notify(p.userId, '⚖️', 'تعديل على ذمتك: ' + (amount > 0 ? '+' : '') + amount + ' د.ع — ' + note, null)
       await audit(actor.name, 'تعديل ذمة ' + (amount > 0 ? '+' : '') + amount + ' — ' + note)
       return { debt: nd }
