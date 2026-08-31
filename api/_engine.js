@@ -691,24 +691,6 @@ async function runAction(actor, action, p) {
       if (actor.role === 'admin') await audit(actor.name, 'تغيير كلمة مرور الإدارة')
       return { ok: true }
     }
-    // ---------------- admin: areas / delete service / notifications ----------------
-    case 'saveAreas': {
-      forbid(isAdmin)
-      const areas = Array.isArray(p.areas) ? p.areas.map((x) => String(x).trim()).filter(Boolean) : []
-      need(areas.length >= 2, 'bad_area')
-      await dal.update('ur_settings', { key: 'areas' }, { value: areas })
-      await audit(actor.name, '\u062a\u0639\u062f\u064a\u0644 \u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u0645\u0646\u0627\u0637\u0642')
-      return {}
-    }
-    case 'deleteService': {
-      forbid(isAdmin)
-      const s3 = await svc(p.serviceId); need(s3, 'service_not_found')
-      const used = await dal.all('ur_orders', { service_id: s3.id })
-      need(used.length === 0, 'service_in_use')
-      await dal.del('ur_services', { id: s3.id })
-      await audit(actor.name, '\u062d\u0630\u0641 \u062e\u062f\u0645\u0629 ' + s3.name)
-      return {}
-    }
     case 'markRead': {
       const num = parseInt(String(p.noteId || '').replace(/^n/, ''))
       if (!num) return {}
