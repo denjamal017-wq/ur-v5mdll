@@ -250,5 +250,9 @@ async function me(req, res) {
     provider = await dal.find('ur_providers', { profile_id: profile.id })
   }
 
-  return json(res, 200, { ok: true, user: profile, provider })
+  // لا نرسل أبداً pass_hash أو بصمات الأجهزة للعميل — جلسة + هوية تكفي
+  const safeUser = Object.assign({}, profile)
+  delete safeUser.pass_hash
+  delete safeUser.devices
+  return json(res, 200, { ok: true, user: safeUser, provider })
 }
