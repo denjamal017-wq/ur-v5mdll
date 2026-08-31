@@ -1,5 +1,6 @@
 /* ================= UR v6 — طبقة السحابة (Vercel + Supabase) =================
-   كل إجراء يروح للسيرفر ويتخزن بقاعدة البيانات — ماكو شي وهمي أبداً. */
+   كل إجراء يروح للسيرفر ويتخزن بقاعدة البيانات — ماكو شي وهمي أبداً.
+   v7 — النزاهة المالية: الذمة الموثّقة + بلاغ السداد بخطوتين + رسائل الثغرات المسدودة. */
 (function(){
 'use strict';
 
@@ -59,7 +60,7 @@ var ERR={
   order_not_done:'\u26a0\ufe0f لازم يكتمل الطلب أولاً',
   price_not_confirmed:'\u26a0\ufe0f الزبون لازم يوافق على السعر النهائي أولاً',
   cannot_advance:'\u26a0\ufe0f ما يمكن تقديم حالة الطلب الآن',
-  bad_price:'\u26a0\ufe0f أدخل سعراً صحيحاً',
+  bad_price:'\u26a0\ufe0f أدخل سعراً صحيحاً من مضاعفات 250 د.ع',
   below_min:'\u26a0\ufe0f الرصيد أقل من الحد الأدنى للتسوية',
   bad_stars:'\u26a0\ufe0f اختر تقييماً من 1 إلى 5',
   already_rated:'\u26a0\ufe0f قيّمت هذا الطلب من قبل',
@@ -70,13 +71,18 @@ var ERR={
   service_not_found:'\u26a0\ufe0f الخدمة غير موجودة',
   service_in_use:'\u26a0\ufe0f لا يمكن حذف خدمة عليها طلبات — عطّلها بدلاً من ذلك',
   user_not_found:'\u26a0\ufe0f المستخدم غير موجود',
-  payout_unavailable:'\u26a0\ufe0f طلب التسوية غير متاح',
+  payout_unavailable:'\u26a0\ufe0f عندك بلاغ سداد مفتوح — انتظر تأكيد الإدارة',
   bad_name:'\u270d\ufe0f اكتب اسماً صحيحاً',
   bad_phone:'\ud83d\udcf1 رقم الهاتف لازم يكون 11 رقم ويبدأ بـ 07',
   bad_pass:'\ud83d\udd11 كلمة المرور 6 أحرف على الأقل',
   bad_area:'\ud83d\udccd اختر منطقة',
   bad_range:'\u26a0\ufe0f تحقق من نطاق السعر',
-  service_required:'\ud83e\uddf0 اختر خدمتك الرئيسية'
+  service_required:'\ud83e\uddf0 اختر خدمتك الرئيسية',
+  too_many_open:'\u26a0\ufe0f عندك 3 طلبات مفتوحة — أكمل أو ألغِ واحداً قبل ما تطلب من جديد',
+  self_dealing:'\ud83d\udeab النظام كشف تطابق جهاز بين الطرفين — التعامل الذاتي ممنوع ويُوثَّق',
+  debt_blocked:'\ud83d\udeab ذمتك تجاوزت حد الإيقاف — سدّد أولاً حتى ترجع تستلم طلبات',
+  overpay:'\u26a0\ufe0f المبلغ أكبر من ذمتك الحالية',
+  cannot_delete_admin:'\ud83d\udeab لا يمكن حذف حساب الإدارة'
 };
 function errMsg(code){ return ERR[code] || ('\u26a0\ufe0f صار خطأ' + (code?(' ('+code+')'):'')); }
 
@@ -128,8 +134,18 @@ function installCloud(){
   window.doCancelOrder = wrap('cancelOrder', function(id){ return {orderId:id}; },
     function(r,id){ closeModal(); toast('تم إلغاء الطلب'); renderOrder(id); renderHeader(currentRoute().name); });
 
-  window.requestPayout = wrap('requestPayout', function(){ return {}; },
-    function(r){ toast('\ud83d\udcb8 طلب التسوية وصل الإدارة — تعتمدها بأسرع وقت'); renderProvider('earnings'); });
+  // v7 — بلاغ سداد ذمة: المقدم يدفع للمنصة (كاش/محفظة) والإدارة تؤكد الاستلام.
+  //  المنصة لا تدفع لأحد أبداً — ماكو «طلب تسوية» يسحب فلوس منها.
+  window.requestPayout = function(){
+    var u=me(); var debt=(u&&u.provider&&u.provider.debt)||0;
+    var inp=$('payAmount'); var v=parseInt(inp&&inp.value,10)||debt;
+    if(!v||v<250||v%250!==0){ toast('\u26a0\ufe0f أدخل مبلغاً صحيحاً من مضاعفات 250 د.ع'); return; }
+    if(v>debt){ toast('\u26a0\ufe0f المبلغ أكبر من ذمتك الحالية ('+debt+' د.ع)'); return; }
+    cloudCall('reportPayment',{amount:v}).then(function(){
+      toast('\ud83d\udcb5 بلاغ السداد وصل الإدارة — تُخصم الذمة بعد تأكيد الاستلام');
+      renderProvider('earnings');
+    }).catch(function(e){ toast(errMsg(e&&e.code)); });
+  };
 
   window.toggleAvail = wrap('toggleAvail', function(){ return {}; },
     function(r){ var u=me(); var av=!!(u&&u.provider&&u.provider.avail); toast(av?'\u2713 أنت متاح — الطلبات توصلك':'\u23f8\ufe0f أنت مشغول — ما توصلك طلبات'); renderProvider(currentRoute().param||'incoming'); });
@@ -170,8 +186,9 @@ function installCloud(){
     });
   };
 
-  window.payPayout = wrap('payPayout', function(id){ return {payoutId:id}; },
-    function(r,id){ toast('\u2713 تم اعتماد الدفع'); renderAdmin('finance'); });
+  // v7 — تأكيد استلام سداد (إدارة): ينزل الذمة ويقيّد بالدفتر
+  window.payPayout = wrap('confirmSettlement', function(id){ return {payoutId:id}; },
+    function(r,id){ toast('\u2713 تم تأكيد استلام السداد وتحديث ذمة المقدم'); renderAdmin('finance'); });
 
   window.saveSettings = wrap('saveSettings',
     function(){ return { commission:{ first:parseInt($('stFirst').value,10), standard:parseInt($('stStd').value,10), loyal:parseInt($('stLoyal').value,10), elite:parseInt($('stElite').value,10), delivery:parseInt($('stDeliv').value,10) }, minPayout:parseInt($('stMinPay').value,10), loyalAt:parseInt($('stLoyalAt').value,10), eliteAt:parseInt($('stEliteAt').value,10) }; },
