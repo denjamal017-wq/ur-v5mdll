@@ -1,7 +1,7 @@
 /* ================= UR v6 — طبقة السحابة (Vercel + Supabase) =================
    كل إجراء يروح للسيرفر ويتخزن بقاعدة البيانات — ماكو شي وهمي أبداً.
-   v8.1 — مصفوفة صلاحيات صفحة الطلب (المقدم ما يلغي أبداً) + رؤية المعلق للمقدم +
-          واجهة الذمة الموثقة + قفل السعر فقط عند التخصيص + إصلاح نص مكسور. */
+   v8.2 — مصفوفة صلاحيات صفحة الطلب (المقدم ما يلغي أبداً) + رؤية المعلق للمقدم +
+          واجهة الذمة الموثقة + قفل السعر فقط عند التخصيص + حسم النزاع للإدارة. */
 (function(){
 'use strict';
 
@@ -84,7 +84,8 @@ var ERR={
   self_dealing:'\ud83d\udeab النظام كشف تطابق جهاز بين الطرفين — التعامل الذاتي ممنوع ويُوثَّق',
   debt_blocked:'\ud83d\udeab ذمتك تجاوزت حد الإيقاف — سدّد أولاً حتى ترجع تستلم طلبات',
   overpay:'\u26a0\ufe0f المبلغ أكبر من ذمتك الحالية',
-  cannot_delete_admin:'\ud83d\udeab لا يمكن حذف حساب الإدارة'
+  cannot_delete_admin:'\ud83d\udeab لا يمكن حذف حساب الإدارة',
+  disputed_open:'\u2696\ufe0f الطلب عليه نزاع مفتوح — ما يكتمِل حتى تُحسم الإدارة'
 };
 function errMsg(code){ return ERR[code] || ('\u26a0\ufe0f صار خطأ' + (code?(' ('+code+')'):'')); }
 
@@ -191,6 +192,16 @@ function installCloud(){
   // v7 — تأكيد استلام سداد (إدارة): ينزل الذمة ويقيّد بالدفتر
   window.payPayout = wrap('confirmSettlement', function(id){ return {payoutId:id}; },
     function(r,id){ toast('\u2713 تم تأكيد استلام السداد وتحديث ذمة المقدم'); renderAdmin('finance'); });
+
+  // v8.2 — حسم النزاع (إدارة): يفك قفل الإكمال بعد الحسم
+  window.resolveDispute = wrap('resolveDispute', function(id){ return {orderId:id}; },
+    function(r,id){ toast('\u2713 انحسم النزاع — الطلب يرجع لمساره الطبيعي'); renderOrder(id); renderHeader(currentRoute().name); });
+
+  // v8.2 — إيراد المنصة يُحسب من العمولات الموثّقة المقرّبة (مو التقديرية)
+  window.platformRevenue = function(){
+    if(!DB || !Array.isArray(DB.orders)) return 0;
+    return DB.orders.filter(o=>o && o.status==='done').reduce(function(sum,o){ const e=earningsOf(o); return sum + ((o.commissionAmount!=null)?o.commissionAmount:e.commission); },0);
+  };
 
   window.saveSettings = wrap('saveSettings',
     function(){ return { commission:{ first:parseInt($('stFirst').value,10), standard:parseInt($('stStd').value,10), loyal:parseInt($('stLoyal').value,10), elite:parseInt($('stElite').value,10), delivery:parseInt($('stDeliv').value,10) }, minPayout:parseInt($('stMinPay').value,10), loyalAt:parseInt($('stLoyalAt').value,10), eliteAt:parseInt($('stEliteAt').value,10) }; },
@@ -539,6 +550,7 @@ function installCloud(){
       : '<button class="btn btn-primary btn-sm" disabled title="'+(verified?'فعّل التوفر من لوحتك':'ينتظر توثيق الإدارة')+'">✅ قبول الطلب</button>';
     actions+='<button class="btn btn-ghost btn-sm" onclick="rejectOrder(\''+o.id+'\')">✗ تجاهل</button>';
   }
+  if(isAdm&&o.disputed&&o.status!=='cancelled') actions+='<button class="btn btn-primary btn-sm" onclick="resolveDispute(\''+o.id+'\')">✓ حسم النزاع</button>';
   if(isAdm&&o.status!=='cancelled'&&o.status!=='done') actions+='<button class="btn btn-danger btn-sm" onclick="cancelOrderAsk(\''+o.id+'\')">🛡️ إلغاء إداري</button>';
 
   // التقييم
