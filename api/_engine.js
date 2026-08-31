@@ -3,8 +3,8 @@
 //  Assembles the exact DB snapshot the frontend render code consumes,
 //  and applies every mutation with the exact same rules as the client.
 //  Uses ONLY dal.* so it runs identically in prod and in the offline test.
-//  v7.1 — صلاحيات صارمة: الإلغاء للزبون/الإدارة فقط · قفل السعر بعد الموافقة
-//  · التقدير يُحسب من الكتالوج بالسيرفر · تعليم الأسعار تحت الأرضية.
+//  v7.2 — مطابقة متعددة المهن (service_ids) · حارس نطاق القبول · قفل السعر
+//  فقط عند التخصيص · الإلغاء للزبون/الإدارة فقط · التقدير من الكتالوج.
 // =====================================================================
 const { dal, hashPassword, verifyPassword, ENV } = require('./_lib')
 
@@ -111,9 +111,12 @@ function areaMatch(prov, area) {
   return arr.indexOf('\u0643\u0644 \u0627\u0644\u0646\u0627\u0635\u0631\u064a\u0629') >= 0 || arr.indexOf(area) >= 0
 }
 async function providersMatching(serviceId, area, excludeId) {
-  const provs = await dal.all('ur_providers', { service_id: serviceId })
+  // multi-service: المقدم يطابق بأي وحدة من مهنه (مو بس الأساسية)
+  const provs = await dal.all('ur_providers')
   const out = []
   for (const p of provs) {
+    const ids = (Array.isArray(p.service_ids) && p.service_ids.length) ? p.service_ids : [p.service_id]
+    if (ids.indexOf(serviceId) < 0) continue
     if (p.verified !== 'verified' || !p.avail) continue
     if (excludeId && p.profile_id === excludeId) continue
     if (area && !areaMatch(p, area)) continue
@@ -224,6 +227,7 @@ async function snapshot(viewer) {
 
       u.provider = {
         serviceId: (pv && pv.service_id) || 's1',
+        serviceIds: (pv && Array.isArray(pv.service_ids) && pv.service_ids.length) ? pv.service_ids : [ (pv && pv.service_id) || 's1' ],
         exp: (pv && pv.exp) || 0,
         areas: (pv && Array.isArray(pv.areas) && pv.areas.length) ? pv.areas : ['كل الناصرية', pf.area || 'الناصرية'],
         verified: pVerified,
@@ -244,15 +248,16 @@ async function snapshot(viewer) {
 
   // ---- orders (scoped)
   const myProv = (viewer && viewer.role === 'provider') ? (provByProfile[viewer.id] || {
-    service_id: 's1', areas: ['كل الناصرية', viewer.area || 'الناصرية'], verified: 'pending', avail: true
+    service_id: 's1', service_ids: ['s1'], areas: ['كل الناصرية', viewer.area || 'الناصرية'], verified: 'pending', avail: true
   }) : null
+  const mySvcIds = myProv ? ((Array.isArray(myProv.service_ids) && myProv.service_ids.length) ? myProv.service_ids : [myProv.service_id]) : []
   function orderVisible(o) {
     if (isAdmin) return true
     if (!viewer) return false
     if (o.customer_id === viewer.id) return true
     if (o.provider_id === viewer.id) return true
     if (viewer.role === 'provider' && myProv && o.status === 'pending' &&
-        o.service_id === myProv.service_id && areaMatch(myProv, o.area) &&
+        mySvcIds.indexOf(o.service_id) >= 0 && areaMatch(myProv, o.area) &&
         (o.rejected_by || []).indexOf(viewer.id) < 0 && o.customer_id !== viewer.id) return true
     return false
   }
@@ -270,7 +275,7 @@ async function snapshot(viewer) {
       flagged: isAdmin ? !!o.flagged : false,
       review: rv ? { stars: rv.stars, text: rv.body, at: toMs(rv.created_at) } : null,
       disputed: !!o.disputed, rejectedBy: o.rejected_by || [], doneAt: toMs(o.done_at),
-      cancelledBy: o.cancelledBy || null, cancelReason: o.cancel_reason || null,
+      cancelledBy: o.cancelled_by || null, cancelReason: o.cancel_reason || null,
     }
   }
   const visibleOrders = allOrders.filter(orderVisible)
@@ -455,6 +460,9 @@ async function runAction(actor, action, p) {
       const o = await getOrder(p.orderId); need(o && o.status === 'pending', 'order_unavailable')
       need(prov.verified === 'verified', 'not_verified')
       need(prov.avail, 'not_available')
+      // لا قبول خارج نطاق مهنه ومناطقه — الصلاحية على السيرفر مو بس بالواجهة
+      const provSvcIds = (Array.isArray(prov.service_ids) && prov.service_ids.length) ? prov.service_ids : [prov.service_id]
+      need(provSvcIds.indexOf(o.service_id) >= 0 && areaMatch(prov, o.area), 'forbidden')
       // بوابة الذمة: من تجاوز حد الإيقاف ما يستلم طلبات حتى يسدّد
       need((prov.debt || 0) < ((S.debt && S.debt.blockAt) || 50000), 'debt_blocked')
       const rate = await commissionRateFor(prov, o, S)
@@ -486,7 +494,8 @@ async function runAction(actor, action, p) {
     case 'advanceOrder': {
       const o = await getOrder(p.orderId); need(o, 'order_not_found')
       forbid(o.provider_id === actor.id || isAdmin)
-      if (o.status === 'accepted' && o.final_price != null && !o.price_confirmed) need(false, 'price_not_confirmed')
+      // القفل يشتغل فقط إذا المقدم غيّر السعر عن التقديري — بالسعر التقديري يكمل عادي بدون انتظار
+      if (o.status === 'accepted' && o.final_price != null && o.final_price !== o.estimate && !o.price_confirmed) need(false, 'price_not_confirmed')
       const i = STATUS_ORDER.indexOf(o.status); need(i >= 0 && i < STATUS_ORDER.length - 1, 'cannot_advance')
       const next = STATUS_ORDER[i + 1]
       const patch = { status: next, timeline: (o.timeline || []).concat([{ s: next, at: Date.now() }]) }
@@ -773,7 +782,7 @@ async function runAction(actor, action, p) {
 
       const s2 = await svc(serviceIds[0]); need(s2, 'service_not_found')
       await dal.update('ur_profiles', { id: actor.id }, { name: name, phone: phone })
-      const patch = { service_id: s2.id, exp: Math.max(0, parseInt(p.exp) || 0), areas: areas }
+      const patch = { service_id: s2.id, service_ids: serviceIds, exp: Math.max(0, parseInt(p.exp) || 0), areas: areas }
       if (s2.sensitive && !prov.sensitive) {
         patch.sensitive = true
         patch.verified = 'pending'
