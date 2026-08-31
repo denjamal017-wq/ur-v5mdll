@@ -22,6 +22,14 @@ const _ipRegistrations = new Map()       // ip -> Set of phones
 const _deviceRegistrations = new Map()   // deviceId -> Set of phones
 const _bannedIps = new Set()
 const _bannedDevices = new Set()
+const _loginFails = new Map()   // ip -> { count, first } — كبح المحاولات المتكررة
+
+function noteLoginFail(ip) {
+  const t = Date.now()
+  const cur = _loginFails.get(ip)
+  if (!cur || (t - cur.first) >= 600000) _loginFails.set(ip, { count: 1, first: t })
+  else cur.count++
+}
 
 function getClientIp(req) {
   const xf = req.headers['x-forwarded-for']
@@ -221,13 +229,20 @@ async function login(res, b, req) {
     })
   }
 
+  // Anti brute-force: 6 محاولات فاشلة خلال 10 دقائق من نفس الـ IP → إيقاف مؤقت
+  const _lf = _loginFails.get(ip)
+  if (_lf && _lf.count >= 6 && (Date.now() - _lf.first) < 600000) {
+    return json(res, 429, { ok: false, error: 'device_blocked', message: '🚫 محاولات دخول كثيرة — انتظر شوية وحاول من جديد' })
+  }
+
   const profile = await dal.find('ur_profiles', { phone })
-  if (!profile) return json(res, 401, { ok: false, error: 'not_registered' })
+  if (!profile) { noteLoginFail(ip); return json(res, 401, { ok: false, error: 'not_registered' }) }
   if (profile.status === 'suspended') return json(res, 403, { ok: false, error: 'suspended' })
 
   const ok = await verifyPassword(pass, profile.pass_hash)
-  if (!ok) return json(res, 401, { ok: false, error: 'bad_credentials' })
+  if (!ok) { noteLoginFail(ip); return json(res, 401, { ok: false, error: 'bad_credentials' }) }
 
+  _loginFails.delete(ip) // دخول ناجح يصفّر العداد
   // نلحق بصمة الجهاز بكل دخول ناجح (آخر 10 أجهزة) — كشف التعامل الذاتي
   const devs = Array.from(new Set([].concat(profile.devices || [], [deviceId]))).slice(-10)
   try { await dal.update('ur_profiles', { id: profile.id }, { devices: devs }) } catch (_) {}
