@@ -177,6 +177,7 @@ async function register(res, b, req) {
     await dal.insert('ur_providers', {
       profile_id: profile.id,
       service_id: primaryServiceRow.id,
+      service_ids: selectedServiceIds,
       exp: exp,
       areas: areas,
       verified: sensitive ? 'pending' : 'verified',
