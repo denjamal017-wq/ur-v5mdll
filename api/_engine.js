@@ -3,8 +3,8 @@
 //  Assembles the exact DB snapshot the frontend render code consumes,
 //  and applies every mutation with the exact same rules as the client.
 //  Uses ONLY dal.* so it runs identically in prod and in the offline test.
-//  v7.2 — مطابقة متعددة المهن (service_ids) · حارس نطاق القبول · قفل السعر
-//  فقط عند التخصيص · الإلغاء للزبون/الإدارة فقط · التقدير من الكتالوج.
+//  v7.3 — تنبيه «طلب بلا مقدم» · قفل الإكمال أثناء النزاع + resolveDispute
+//  · حارس confirmPrice · الحذف يتطلب ذمة صفرية · v7.2: مهن متعددة وقفل سعر شرطي.
 // =====================================================================
 const { dal, hashPassword, verifyPassword, ENV } = require('./_lib')
 
@@ -426,12 +426,16 @@ async function runAction(actor, action, p) {
         flagged: flagged, created_at: nowIso(),
       })
       if (flagged) await notifyAdmins('🚨', 'طلب ' + id + ' مُعلَّم: تطابق بصمة جهاز الزبون مع جهاز مقدم خدمة مطابق (اشتباه تعامل ذاتي)', id)
+      // ماكو مقدم متاح؟ الإدارة لازم تدري فوراً — الطلب ما يظل صامت
+      if (!targets.length) await notifyAdmins('⚠️', 'طلب ' + id + ' (' + (s ? s.name : '') + ' — ' + p.area + ') بدون مقدم موثّق متاح — وفّر مقدم أو كلّف أحد', id)
       for (const t of targets) await notify(t.profile_id, '\ud83d\udce5', '\u0637\u0644\u0628 \u062c\u062f\u064a\u062f ' + id + ' \u0628\u0645\u0646\u0637\u0642\u062a\u0643 \u2014 ' + (s ? s.name : ''), id)
       return { orderId: id }
     }
     case 'confirmPrice': {
       const o = await getOrder(p.orderId); need(o, 'order_not_found')
       forbid(o.customer_id === actor.id || isAdmin)
+      // الموافقة فقط على سعر مخصص بحالة مقبول — ما تنضغط على فراغ أو على طلب مكتمل
+      need(o.status === 'accepted' && o.final_price != null && o.final_price !== o.estimate && !o.price_confirmed, 'order_unavailable')
       await dal.update('ur_orders', { id: o.id }, { price_confirmed: true })
       if (o.provider_id) await notify(o.provider_id, '\ud83d\udcb0', '\u0627\u0644\u0632\u0628\u0648\u0646 \u0648\u0627\u0641\u0642 \u0639\u0644\u0649 \u0627\u0644\u0633\u0639\u0631 \u0627\u0644\u0646\u0647\u0627\u0626\u064a \u0644\u0644\u0637\u0644\u0628 ' + o.id, o.id)
       return {}
@@ -498,6 +502,8 @@ async function runAction(actor, action, p) {
       if (o.status === 'accepted' && o.final_price != null && o.final_price !== o.estimate && !o.price_confirmed) need(false, 'price_not_confirmed')
       const i = STATUS_ORDER.indexOf(o.status); need(i >= 0 && i < STATUS_ORDER.length - 1, 'cannot_advance')
       const next = STATUS_ORDER[i + 1]
+      // الإكمال حدث مالي — طلب عليه نزاع مفتوح ما يكتمِل حتى تُحسم الإدارة
+      if (next === 'done' && o.disputed) need(false, 'disputed_open')
       const patch = { status: next, timeline: (o.timeline || []).concat([{ s: next, at: Date.now() }]) }
       if (next === 'done') {
         patch.done_at = nowIso()
@@ -606,6 +612,16 @@ async function runAction(actor, action, p) {
       await dal.insert('ur_ticket_messages', { ticket_id: id, from_id: actor.id, body: body, created_at: nowIso() })
       await notifyAdmins('\u26a0\ufe0f', '\u0646\u0632\u0627\u0639 \u062c\u062f\u064a\u062f \u0639\u0644\u0649 \u0627\u0644\u0637\u0644\u0628 ' + o.id, o.id)
       return { ticketId: id }
+    }
+    case 'resolveDispute': {
+      forbid(isAdmin)
+      const o = await getOrder(p.orderId); need(o, 'order_not_found')
+      need(o.disputed, 'order_unavailable')
+      await dal.update('ur_orders', { id: o.id }, { disputed: false })
+      await notify(o.customer_id, '✅', 'انحسم النزاع على طلبك ' + o.id + ' — الإدارة راجعت وحسمت', o.id)
+      if (o.provider_id) await notify(o.provider_id, '✅', 'انحسم النزاع على الطلب ' + o.id, o.id)
+      await audit(actor.name, 'حسم النزاع على الطلب ' + o.id)
+      return {}
     }
     case 'replyTicket': {
       const t = await dal.find('ur_tickets', { id: p.ticketId }); need(t, 'ticket_not_found')
@@ -826,6 +842,9 @@ async function runAction(actor, action, p) {
         need(verifyPassword(String(p.pass || ''), target.pass_hash), 'bad_credentials')
       }
       
+      // المقدم ما يحذف حسابه وعليه ذمة — الذمة ما تموت بالحذف
+      const provRow = await getProvider(target.id)
+      if (provRow) need((provRow.debt || 0) === 0, 'debt_blocked')
       // Preserve tickets, messages, and orders: anonymize user profile and remove provider role
       const freedPhone = '07000' + Math.floor(100000 + Math.random() * 900000);
       await dal.update('ur_profiles', { id: target.id }, {
