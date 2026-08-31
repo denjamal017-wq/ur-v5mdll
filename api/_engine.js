@@ -3,8 +3,8 @@
 //  Assembles the exact DB snapshot the frontend render code consumes,
 //  and applies every mutation with the exact same rules as the client.
 //  Uses ONLY dal.* so it runs identically in prod and in the offline test.
-//  v7.4 — قبول/سداد ذريان CAS · قفل تفاؤلي للذمة · خصوصية العنوان الدقيق
-//  · عدالة الإلغاء (الزبون قبل الانطلاق فقط) · حُرّاس سباق البلاغ والتقييم.
+//  v7.5 — إلغاء التوقف +24س · حارس سوء الإلغاء · revertToEstimate · نمط
+//  الاعتذارات · تنظيف السوق 48س · قياس الاستجابة · v7.4: ذرية CAS كاملة.
 // =====================================================================
 const { dal, hashPassword, verifyPassword, ENV } = require('./_lib')
 
@@ -192,6 +192,22 @@ async function snapshot(viewer) {
   ])
   const { cats, services, S } = staticData
 
+  // تنظيف السوق: طلب معلّق أكثر من 48 ساعة ينلغي تلقائياً ويُخطر الزبون (CAS — ما يتكرر)
+  const staleBefore = Date.now() - 48 * 3600000
+  for (const o of allOrders) {
+    if (o.status === 'pending' && (toMs(o.created_at) || 0) < staleBefore) {
+      const swept = await dal.update('ur_orders', { id: o.id, status: 'pending' }, {
+        status: 'cancelled', cancelled_by: null,
+        cancel_reason: 'انتهت صلاحية الطلب تلقائياً — ما انقبل خلال 48 ساعة',
+        timeline: (o.timeline || []).concat([{ s: 'cancelled', at: Date.now() }]),
+      })
+      if (swept && swept.length) {
+        o.status = 'cancelled'
+        await notify(o.customer_id, '⌛', 'طلبك ' + o.id + ' انتهت صلاحيته — ما لكّى مقدم متاح بمنطقتك. اطلب من جديد وإحنا نوسّع التغطية.', o.id)
+      }
+    }
+  }
+
   const provByProfile = {}
   for (const p of providers) provByProfile[p.profile_id] = p
   const reviewByOrder = {}
@@ -246,6 +262,7 @@ async function snapshot(viewer) {
         balance: (pv && pv.balance) || 0,
         settled: (pv && pv.settled) || 0,
         debt: (pv && pv.debt) || 0,
+        avgResponseMin: (pv && pv.resp_count) ? Math.max(1, Math.round((pv.resp_sum || 0) / pv.resp_count)) : null,
         sensitive: pv ? !!pv.sensitive : false,
         rejectReason: rejectReason || '',
         adminNote: adminNote || '',
@@ -413,6 +430,11 @@ async function runAction(actor, action, p) {
       // مكافحة الإغراق: حد أقصى للطلبات المفتوحة لكل زبون
       const myOpen = (await dal.all('ur_orders', { customer_id: actor.id, status: 'pending' })).length
       need(myOpen < ((S.debt && S.debt.maxOpenOrders) || 3), 'too_many_open')
+      // سوء استخدام الإلغاء: 3 إلغاءات خلال 24 ساعة → إيقاف الطلبات مؤقتاً (حماية وقت المقدمين)
+      const dayAgo = Date.now() - 86400000
+      const myCancels = (await dal.all('ur_orders', { customer_id: actor.id, status: 'cancelled' }))
+        .filter((x) => x.cancelled_by === actor.id && toMs(x.created_at) > dayAgo).length
+      need(myCancels < 3, 'cancel_abuse')
       const seq = await dal.nextSeq('order', 1042)
       const id = 'UR-' + seq
       // كشف التعامل الذاتي: تطابق بصمة جهاز الزبون مع جهاز أي مقدم مطابق
@@ -491,6 +513,9 @@ async function runAction(actor, action, p) {
         timeline: (o.timeline || []).concat([{ s: 'accepted', at: Date.now() }]),
       })
       need(accepted.length > 0, 'order_unavailable')
+      // قياس سرعة الاستجابة — متوسط تراكمي يظهر بملف المقدم
+      const respMin = Math.max(1, Math.round((Date.now() - (toMs(o.created_at) || Date.now())) / 60000))
+      await dal.update('ur_providers', { profile_id: actor.id }, { resp_sum: (prov.resp_sum || 0) + respMin, resp_count: (prov.resp_count || 0) + 1 })
       await notify(o.customer_id, '\u2705', '\u0645\u0642\u062f\u0645 \u0645\u0648\u062b\u0651\u0642 \u0642\u0628\u0644 \u0637\u0644\u0628\u0643 ' + o.id + ': ' + actor.name, o.id)
       await audit(actor.name, '\u0642\u0628\u0648\u0644 \u0627\u0644\u0637\u0644\u0628 ' + o.id)
       return {}
@@ -509,6 +534,16 @@ async function runAction(actor, action, p) {
         await notifyAdmins('🚨', 'طلب ' + o.id + ' سُعّر بـ ' + v + ' د.ع — تحت أرضية الكتالوج (' + sv.min_price + ') — اشتباه التفاف على العمولة', o.id)
       }
       await notify(o.customer_id, '\ud83d\udcb0', '\u0645\u0642\u062f\u0645 \u0627\u0644\u062e\u062f\u0645\u0629 \u062d\u062f\u062f \u0627\u0644\u0633\u0639\u0631 \u0627\u0644\u0646\u0647\u0627\u0626\u064a \u0644\u0644\u0637\u0644\u0628 ' + o.id + ': ' + v + ' \u062f.\u0639', o.id)
+      return {}
+    }
+    case 'revertToEstimate': {
+      const o = await getOrder(p.orderId); need(o, 'order_not_found')
+      forbid(o.provider_id === actor.id)
+      // المقدم يرجّع الطلب للسعر التقديري ويكمّل بدون انتظار — يفكّ جمود «الزبون ما رد»
+      need(o.status === 'accepted' && o.final_price != null && o.final_price !== o.estimate && !o.price_confirmed, 'order_unavailable')
+      await dal.update('ur_orders', { id: o.id }, { final_price: o.estimate, price_confirmed: false })
+      await notify(o.customer_id, '\ud83d\udcb0', 'مقدم الخدمة رجّع طلبك ' + o.id + ' للسعر التقديري (' + o.estimate + ' د.ع) ويكمّل بدون انتظار', o.id)
+      await audit(actor.name, 'رجّع السعر للتقديري ' + o.id)
       return {}
     }
     case 'advanceOrder': {
@@ -553,6 +588,13 @@ async function runAction(actor, action, p) {
         status: 'pending', final_price: null, price_confirmed: false, commission_rate: null,
         timeline: (o.timeline || []).concat([{ s: 'pending', at: Date.now() }]),
       })
+      // نمط الاعتذارات: كل 3 اعتذارات تراكمية → تنبيه مراجعة أداء للإدارة
+      const provD = await getProvider(actor.id)
+      if (provD) {
+        const dc = (provD.drop_count || 0) + 1
+        await dal.update('ur_providers', { profile_id: actor.id }, { drop_count: dc })
+        if (dc >= 3 && dc % 3 === 0) await notifyAdmins('⚠️', 'مقدم ' + actor.name + ' اعتذر عن ' + dc + ' طلبات — راجع أداءه', null)
+      }
       await notify(o.customer_id, '\ud83d\udd04', '\u0645\u0642\u062f\u0645 \u0627\u0644\u062e\u062f\u0645\u0629 \u0627\u0639\u062a\u0630\u0631 \u0639\u0646 \u0627\u0644\u0637\u0644\u0628 ' + o.id + ' \u2014 \u0631\u062c\u0639 \u0644\u0644\u0645\u0642\u062f\u0645\u064a\u0646', o.id)
       await notifyAdmins('🔄', 'مقدم اعتذر عن الطلب ' + o.id + ' بعد استلامه — ' + actor.name, o.id)
       await audit(actor.name, '\u0627\u0639\u062a\u0630\u0627\u0631 \u0639\u0646 \u0627\u0644\u0637\u0644\u0628 ' + o.id)
@@ -782,8 +824,12 @@ async function runAction(actor, action, p) {
       // ويرجّع الطلب للسوق، لكنه لا يستطيع قتل طلب زبون أبداً — قاعدة سيرفر صارمة.
       forbid(isAdmin || o.customer_id === actor.id)
       need(o.status !== 'done' && o.status !== 'cancelled', 'order_unavailable')
-      // الزبون يلغي فقط قبل انطلاق المقدم — بعدها الإلغاء للإدارة (عدالة الطرفين)
-      if (!isAdmin) need(o.status === 'pending' || o.status === 'accepted', 'order_unavailable')
+      // الزبون يلغي قبل انطلاق المقدم — أو بأي مرحلة إذا المقدم متوقف أكثر من 24 ساعة
+      if (!isAdmin && o.status !== 'pending' && o.status !== 'accepted') {
+        const lastEv = (o.timeline || [])[(o.timeline || []).length - 1]
+        const stalledH = lastEv ? (Date.now() - lastEv.at) / 3600000 : 999
+        need(stalledH >= 24, 'order_unavailable')
+      }
       const who = isAdmin ? '\u0627\u0644\u0625\u062f\u0627\u0631\u0629' : '\u0627\u0644\u0632\u0628\u0648\u0646'
       await dal.update('ur_orders', { id: o.id }, {
         status: 'cancelled', cancelled_by: actor.id,
