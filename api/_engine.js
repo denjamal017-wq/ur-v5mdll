@@ -3,6 +3,8 @@
 //  Assembles the exact DB snapshot the frontend render code consumes,
 //  and applies every mutation with the exact same rules as the client.
 //  Uses ONLY dal.* so it runs identically in prod and in the offline test.
+//  v7 — النزاهة المالية: لا عهدة ولا أرصدة معلّقة. كل عمولة = ذمة موثّقة
+//  بدفتر ur_ledger، مقرّبة لوحدة 250 د.ع، وفرق التقريب يُوثَّق بالقيد.
 // =====================================================================
 const { dal, hashPassword, verifyPassword, ENV } = require('./_lib')
 
@@ -65,6 +67,7 @@ async function settingsMap() {
     commission: m.commission || { first: 18, standard: 15, loyal: 13, elite: 10, delivery: 10 },
     thresholds: m.thresholds || { loyalAt: 11, eliteAt: 31, minPayout: 10000 },
     areas: (m.areas && m.areas.length >= 10) ? m.areas : DEF_NASIRIYAH_AREAS,
+    debt: m.debt || { warnAt: 25000, blockAt: 50000, roundingUnit: 250, maxOpenOrders: 3, loyalMinCustomers: 6, eliteMinCustomers: 15 },
   }
 }
 async function svc(id) { return await dal.find('ur_services', { id }) }
@@ -87,6 +90,22 @@ async function audit(who, action) {
   await dal.insert('ur_audit_log', { actor: who, action: action, created_at: nowIso() })
 }
 
+// ------------------------------------------------------------ DEBT LEDGER
+//  المنصة لا تمسك فلوس أحد أبداً. العمولة دَين (ذمة) على المقدم يوثَّق
+//  بدفتر ur_ledger مع الرصيد بعد كل قيد — كل دينار لازم يتفسَّر.
+//  signedAmount: موجب يرفع الذمة (عمولة/تعديل)، سالب ينزلها (سداد).
+async function applyDebt(providerId, signedAmount, kind, orderId, note) {
+  const prov = await getProvider(providerId)
+  if (!prov) return null
+  const newDebt = Math.max(0, (prov.debt || 0) + signedAmount)
+  await dal.update('ur_providers', { profile_id: providerId }, { debt: newDebt })
+  await dal.insert('ur_ledger', {
+    provider_id: providerId, order_id: orderId || null, kind: kind,
+    amount: signedAmount, balance_after: newDebt, note: note || '', created_at: nowIso(),
+  })
+  return newDebt
+}
+
 function areaMatch(prov, area) {
   const arr = prov.areas || []
   return arr.indexOf('\u0643\u0644 \u0627\u0644\u0646\u0627\u0635\u0631\u064a\u0629') >= 0 || arr.indexOf(area) >= 0
@@ -104,13 +123,16 @@ async function providersMatching(serviceId, area, excludeId) {
   }
   return out
 }
-async function monthDoneCount(providerId) {
+// إحصائيات الشهر: عدد الطلبات المكتملة + عدد الزبائن المختلفين.
+//  الزبائن المختلفون هو قاتل ثغرة «أطلب من نفسي» — 100 طلب من زبون واحد = زبون واحد.
+async function monthStats(providerId) {
   const done = await dal.all('ur_orders', { provider_id: providerId, status: 'done' })
   const d = new Date(), m = d.getMonth(), y = d.getFullYear()
-  return done.filter((o) => {
+  const month = done.filter((o) => {
     const t = new Date(o.done_at || o.created_at)
     return t.getMonth() === m && t.getFullYear() === y
-  }).length
+  })
+  return { count: month.length, customers: new Set(month.map((o) => o.customer_id)).size }
 }
 async function commissionRateFor(prov, order, S) {
   const c = S.commission
@@ -120,16 +142,24 @@ async function commissionRateFor(prov, order, S) {
     provider_id: prov.profile_id, customer_id: order.customer_id, status: 'done',
   })).length
   if (withCustomer === 0) return c.first
-  const month = await monthDoneCount(prov.profile_id)
-  if (month >= S.thresholds.eliteAt) return c.elite
-  if (month >= S.thresholds.loyalAt) return c.loyal
+  const ms = await monthStats(prov.profile_id)
+  const D = S.debt || {}
+  // الشريحة تحتاج عدد طلبات + تنوّع زبائن حقيقي — وإلا تبقى standard مهما سوّى
+  if (ms.count >= S.thresholds.eliteAt && ms.customers >= (D.eliteMinCustomers || 15)) return c.elite
+  if (ms.count >= S.thresholds.loyalAt && ms.customers >= (D.loyalMinCustomers || 6)) return c.loyal
   return c.standard
 }
+//  قانون التقريب: العمولة تُدفع بأوراق نقد عراقية حقيقية — وحدة 250 د.ع.
+//  التقريب للأقرب، والفرق (±124 كحد أقصى) يُوثَّق بعمود rounding_delta
+//  وبملاحظة القيد — الزايد أو الناقص ذمة محاسبية معلنة، ماكو شي يختفي.
 function earnings(order, S) {
   const price = order.final_price != null ? order.final_price : order.estimate
   const rate = order.commission_rate != null ? order.commission_rate : S.commission.standard
-  const commission = round(price * rate / 100)
-  return { price, rate, commission, net: price - commission }
+  const exact = price * rate / 100
+  const unit = (S.debt && S.debt.roundingUnit) || 250
+  const commission = Math.round(exact / unit) * unit
+  const delta = commission - Math.round(exact)
+  return { price, rate, exact: Math.round(exact), commission, delta, net: price - commission }
 }
 
 // ------------------------------------------------------------ SNAPSHOT
@@ -139,13 +169,13 @@ function earnings(order, S) {
 async function snapshot(viewer) {
   const isAdmin = !!(viewer && viewer.role === 'admin')
   const [staticData, profiles, providers, allOrders, reviews,
-    allMsgs, allNotes, tickets, ticketMsgs, payouts, auditRows,
+    allMsgs, allNotes, tickets, ticketMsgs, payouts, auditRows, ledgerRows,
     cOrder, cTicket, cPayout] = await Promise.all([
     getCachedStatic(),
     dal.all('ur_profiles'), dal.all('ur_providers'), dal.all('ur_orders'),
     dal.all('ur_reviews'), dal.all('ur_order_messages'), dal.all('ur_notifications'),
     dal.all('ur_tickets'), dal.all('ur_ticket_messages'), dal.all('ur_payouts'),
-    dal.all('ur_audit_log'),
+    dal.all('ur_audit_log'), dal.all('ur_ledger'),
     dal.find('ur_counters', { kind: 'order' }), dal.find('ur_counters', { kind: 'ticket' }),
     dal.find('ur_counters', { kind: 'payout' }),
   ])
@@ -203,6 +233,7 @@ async function snapshot(viewer) {
         jobs: (pv && pv.jobs) || 0,
         balance: (pv && pv.balance) || 0,
         settled: (pv && pv.settled) || 0,
+        debt: (pv && pv.debt) || 0,
         sensitive: pv ? !!pv.sensitive : false,
         rejectReason: rejectReason || '',
         adminNote: adminNote || '',
@@ -234,6 +265,9 @@ async function snapshot(viewer) {
       finalPrice: o.final_price, priceConfirmed: o.price_confirmed, status: o.status,
       timeline: o.timeline || [], createdAt: toMs(o.created_at),
       commissionRate: o.commission_rate == null ? null : Number(o.commission_rate),
+      commissionAmount: o.commission_amount == null ? null : o.commission_amount,
+      roundingDelta: o.rounding_delta || 0,
+      flagged: isAdmin ? !!o.flagged : false,
       review: rv ? { stars: rv.stars, text: rv.body, at: toMs(rv.created_at) } : null,
       disputed: !!o.disputed, rejectedBy: o.rejected_by || [], doneAt: toMs(o.done_at),
       cancelledBy: o.cancelled_by || null, cancelReason: o.cancel_reason || null,
@@ -271,16 +305,23 @@ async function snapshot(viewer) {
     }))
     .sort((a, b) => b.at - a.at)
 
-  // ---- payouts (mine / all for admin)
+  // ---- payouts (mine / all for admin) — v7: سجل بلاغات السداد من المقدمين
   const payoutsOut = payouts
     .filter((p) => isAdmin || (viewer && p.provider_id === viewer.id))
-    .map((p) => ({ id: p.id, providerId: p.provider_id, amount: p.amount, status: p.status, at: toMs(p.requested_at), paidAt: toMs(p.paid_at) }))
+    .map((p) => ({ id: p.id, providerId: p.provider_id, amount: p.amount, status: p.status, direction: p.direction || 'settlement', at: toMs(p.requested_at), paidAt: toMs(p.paid_at) }))
     .sort((a, b) => b.at - a.at)
 
   // ---- audit (admin only)
   const auditOut = (isAdmin ? auditRows : [])
     .map((a) => ({ at: toMs(a.created_at), who: a.actor, action: a.action }))
     .sort((a, b) => b.at - a.at)
+
+  // ---- ledger (mine / all for admin) — آخر 50 قيد
+  const ledgerOut = (ledgerRows || [])
+    .filter((l) => isAdmin || (viewer && l.provider_id === viewer.id))
+    .sort((a, b) => toMs(b.created_at) - toMs(a.created_at))
+    .slice(0, 50)
+    .map((l) => ({ id: 'l' + l.id, orderId: l.order_id, kind: l.kind, amount: l.amount, balanceAfter: l.balance_after, note: l.note, at: toMs(l.created_at) }))
 
   // ---- global stats for public homepage
   const doneAll = allOrders.filter((o) => o.status === 'done')
@@ -314,6 +355,7 @@ async function snapshot(viewer) {
       commission: S.commission,
       loyalAt: S.thresholds.loyalAt, eliteAt: S.thresholds.eliteAt, minPayout: S.thresholds.minPayout,
       areas: S.areas,
+      debt: S.debt,
     },
     cats: cats.slice().sort((a, b) => (a.sort || 0) - (b.sort || 0)).map((c) => ({ id: c.id, name: c.name, icon: c.icon })),
     services: services.map((s) => ({
@@ -329,6 +371,7 @@ async function snapshot(viewer) {
     tickets: ticketsOut,
     payouts: payoutsOut,
     audit: auditOut,
+    ledger: ledgerOut,
     stats: { verifiedProvs: verifiedProvs, doneOrders: doneAll.length, avgR: avgR, reviews: statReviews },
   }
   return db
@@ -350,8 +393,23 @@ async function runAction(actor, action, p) {
       need(s && s.active !== false, 'service_unavailable')
       need(p.area, 'area_required')
       need(p.estimate && p.estimate > 0, 'estimate_required')
+      // مكافحة الإغراق: حد أقصى للطلبات المفتوحة لكل زبون
+      const myOpen = (await dal.all('ur_orders', { customer_id: actor.id, status: 'pending' })).length
+      need(myOpen < ((S.debt && S.debt.maxOpenOrders) || 3), 'too_many_open')
       const seq = await dal.nextSeq('order', 1042)
       const id = 'UR-' + seq
+      // كشف التعامل الذاتي: تطابق بصمة جهاز الزبون مع جهاز أي مقدم مطابق
+      // → الطلب يُعلَّم للإدارة ويُخفى عن ذلك المقدم تحديداً
+      const myDevices = actor.devices || []
+      let flagged = false
+      const matched = await providersMatching(p.serviceId, p.area, actor.id)
+      const targets = []
+      for (const t of matched) {
+        const tp = await getProfile(t.profile_id)
+        const shared = tp && (tp.devices || []).some((d) => myDevices.indexOf(d) >= 0)
+        if (shared) flagged = true
+        else targets.push(t)
+      }
       await dal.insert('ur_orders', {
         id: id, service_id: p.serviceId, customer_id: actor.id, provider_id: null,
         description: p.desc || '', area: p.area, address: p.address || '',
@@ -359,9 +417,9 @@ async function runAction(actor, action, p) {
         pay_method: p.payMethod === 'wallet' ? 'wallet' : 'cash', estimate: p.estimate,
         final_price: null, price_confirmed: false, status: 'pending', commission_rate: null,
         timeline: [{ s: 'pending', at: Date.now() }], rejected_by: [], disputed: false,
-        created_at: nowIso(),
+        flagged: flagged, created_at: nowIso(),
       })
-      const targets = await providersMatching(p.serviceId, p.area, actor.id)
+      if (flagged) await notifyAdmins('🚨', 'طلب ' + id + ' مُعلَّم: تطابق بصمة جهاز الزبون مع جهاز مقدم خدمة مطابق (اشتباه تعامل ذاتي)', id)
       for (const t of targets) await notify(t.profile_id, '\ud83d\udce5', '\u0637\u0644\u0628 \u062c\u062f\u064a\u062f ' + id + ' \u0628\u0645\u0646\u0637\u0642\u062a\u0643 \u2014 ' + (s ? s.name : ''), id)
       return { orderId: id }
     }
@@ -380,6 +438,10 @@ async function runAction(actor, action, p) {
       need(stars >= 1 && stars <= 5, 'bad_stars')
       const existing = await dal.find('ur_reviews', { order_id: o.id })
       need(!existing, 'already_rated')
+      // مكافحة التقييم الذاتي: نفس الجهاز بين الزبون والمقدم = ممنوع
+      const provProf = o.provider_id ? await getProfile(o.provider_id) : null
+      const sharedDev = provProf && (provProf.devices || []).some((d) => (actor.devices || []).indexOf(d) >= 0)
+      need(!sharedDev, 'self_dealing')
       await dal.insert('ur_reviews', { order_id: o.id, stars: stars, body: p.text || '', created_at: nowIso() })
       const prov = await getProvider(o.provider_id)
       if (prov) await dal.update('ur_providers', { profile_id: o.provider_id }, { rating_sum: prov.rating_sum + stars, rating_count: prov.rating_count + 1 })
@@ -392,6 +454,8 @@ async function runAction(actor, action, p) {
       const o = await getOrder(p.orderId); need(o && o.status === 'pending', 'order_unavailable')
       need(prov.verified === 'verified', 'not_verified')
       need(prov.avail, 'not_available')
+      // بوابة الذمة: من تجاوز حد الإيقاف ما يستلم طلبات حتى يسدّد
+      need((prov.debt || 0) < ((S.debt && S.debt.blockAt) || 50000), 'debt_blocked')
       const rate = await commissionRateFor(prov, o, S)
       await dal.update('ur_orders', { id: o.id }, {
         provider_id: actor.id, status: 'accepted', final_price: o.estimate,
@@ -421,7 +485,19 @@ async function runAction(actor, action, p) {
         patch.done_at = nowIso()
         const prov = await getProvider(o.provider_id)
         const e = earnings(o, S)
-        if (prov) await dal.update('ur_providers', { profile_id: o.provider_id }, { jobs: prov.jobs + 1, balance: prov.balance + e.net })
+        // التوثيق المحاسبي الكامل على الطلب نفسه
+        patch.commission_amount = e.commission
+        patch.rounding_delta = e.delta
+        if (prov) {
+          await dal.update('ur_providers', { profile_id: o.provider_id }, { jobs: prov.jobs + 1 })
+          // العمولة تصير ذمة موثّقة — المنصة ما تدفع ولا تستلم، تسجّل فقط
+          const nd = await applyDebt(o.provider_id, e.commission, 'commission', o.id,
+            'عمولة ' + e.rate + '% عن الطلب ' + o.id + ' بقيمة ' + e.price + ' د.ع' +
+            (e.delta !== 0 ? ' — فرق تقريب موثّق ' + (e.delta > 0 ? '+' : '') + e.delta + ' د.ع' : ''))
+          if (nd != null && nd >= (S.debt.warnAt || 25000) && (prov.debt || 0) < (S.debt.warnAt || 25000)) {
+            await notify(o.provider_id, '⚠️', 'ذمتك للمنصة وصلت ' + nd + ' د.ع — سدّدها قبل حد الإيقاف ' + (S.debt.blockAt || 50000) + ' د.ع', null)
+          }
+        }
         await notify(o.customer_id, '\ud83c\udf89', '\u0637\u0644\u0628\u0643 ' + o.id + ' \u0627\u0643\u062a\u0645\u0644! \u0642\u064a\u0651\u0645 \u0627\u0644\u062e\u062f\u0645\u0629', o.id)
       } else {
         await notify(o.customer_id, '\ud83d\udd14', '\u062a\u062d\u062f\u064a\u062b \u0627\u0644\u0637\u0644\u0628 ' + o.id, o.id)
@@ -441,17 +517,41 @@ async function runAction(actor, action, p) {
       await audit(actor.name, '\u0627\u0639\u062a\u0630\u0627\u0631 \u0639\u0646 \u0627\u0644\u0637\u0644\u0628 ' + o.id)
       return {}
     }
-    case 'requestPayout': {
+    // ---------------- v7: السداد (بلاغ من المقدم ← تأكيد من الإدارة) ----------------
+    case 'reportPayment': {
       const prov = await getProvider(actor.id); need(prov, 'not_provider')
-      const amount = prov.balance
-      need(amount >= S.thresholds.minPayout, 'below_min')
+      const amount = parseInt(p.amount) || 0
+      need(amount >= 250 && amount % 250 === 0, 'bad_price')
+      need(amount <= (prov.debt || 0), 'overpay')
+      const open = await dal.all('ur_payouts', { provider_id: actor.id, status: 'pending' })
+      need(!open.length, 'payout_unavailable')
       const seq = await dal.nextSeq('payout', 1)
-      const id = 'PO-' + seq
-      await dal.insert('ur_payouts', { id: id, provider_id: actor.id, amount: amount, status: 'pending', requested_at: nowIso(), paid_at: null })
-      await dal.update('ur_providers', { profile_id: actor.id }, { balance: 0 })
-      await notifyAdmins('\ud83d\udcb8', '\u0637\u0644\u0628 \u062a\u0633\u0648\u064a\u0629 \u062c\u062f\u064a\u062f ' + id + ' \u0645\u0646 ' + actor.name + ': ' + amount + ' \u062f.\u0639', null)
-      await audit(actor.name, '\u0637\u0644\u0628 \u062a\u0633\u0648\u064a\u0629 ' + id)
-      return { payoutId: id }
+      const id = 'ST-' + seq
+      await dal.insert('ur_payouts', { id: id, provider_id: actor.id, amount: amount, status: 'pending', direction: 'settlement', requested_at: nowIso(), paid_at: null })
+      await notifyAdmins('💵', 'بلاغ سداد ذمة ' + id + ' من ' + actor.name + ': ' + amount + ' د.ع — يحتاج تأكيد استلام', null)
+      await audit(actor.name, 'بلاغ سداد ' + id)
+      return { settlementId: id }
+    }
+    case 'payPayout': case 'confirmSettlement': {
+      forbid(isAdmin)
+      const po = await dal.find('ur_payouts', { id: p.payoutId }); need(po && po.status === 'pending', 'payout_unavailable')
+      const prof = await getProfile(po.provider_id)
+      await dal.update('ur_payouts', { id: po.id }, { status: 'paid', paid_at: nowIso() })
+      // السداد يخفّض الذمة ويُقيد بالدفتر — ماكو خصم بدون قيد
+      const nd = await applyDebt(po.provider_id, -po.amount, 'payment', null, 'تأكيد استلام سداد ' + po.id)
+      await notify(po.provider_id, '✅', 'استلمنا دفعتك ' + po.amount + ' د.ع — ذمتك المتبقية ' + (nd == null ? 0 : nd) + ' د.ع', null)
+      await audit(actor.name, 'تأكيد سداد ' + po.id + ' من ' + (prof ? prof.name : po.provider_id))
+      return { debt: nd }
+    }
+    case 'adjustDebt': {
+      // تسوية قانونية: أي زايد/ناقص يدوي لازم سبب مكتوب + قيد + أثر بالأوديت
+      forbid(isAdmin)
+      const amount = parseInt(p.amount) || 0; need(amount !== 0, 'bad_price')
+      const note = String(p.note || '').trim(); need(note.length >= 3, 'bad_body')
+      const nd = await applyDebt(p.userId, amount, 'adjustment', null, 'تعديل إداري: ' + note)
+      await notify(p.userId, '⚖️', 'تعديل على ذمتك: ' + (amount > 0 ? '+' : '') + amount + ' د.ع — ' + note, null)
+      await audit(actor.name, 'تعديل ذمة ' + (amount > 0 ? '+' : '') + amount + ' — ' + note)
+      return { debt: nd }
     }
     case 'toggleAvail': {
       const prov = await getProvider(actor.id); need(prov, 'not_provider')
@@ -527,16 +627,6 @@ async function runAction(actor, action, p) {
       const actionName = val === 'verified' ? 'توثيق' : val === 'rejected' ? 'رفض' : 'إعادة نظر'
       await audit(actor.name, actionName + ' مقدم الخدمة ' + (prof ? prof.name : p.userId) + (note ? ' (' + note + ')' : ''))
       return { status: val }
-    }
-    case 'payPayout': {
-      forbid(isAdmin)
-      const po = await dal.find('ur_payouts', { id: p.payoutId }); need(po && po.status === 'pending', 'payout_unavailable')
-      await dal.update('ur_payouts', { id: po.id }, { status: 'paid', paid_at: nowIso() })
-      const prov = await getProvider(po.provider_id)
-      if (prov) await dal.update('ur_providers', { profile_id: po.provider_id }, { settled: prov.settled + po.amount })
-      await notify(po.provider_id, '💸', 'تم اعتماد تسويتك ' + po.id + ': ' + po.amount + ' د.ع', null)
-      await audit(actor.name, 'اعتماد تسوية ' + po.id)
-      return {}
     }
     case 'saveSettings': {
       forbid(isAdmin)
