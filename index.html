@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>مدللني — منصة خدمات الناصرية | طلب خدمة بلمسة</title>
+  <meta name="description"
+    content="مدللني mdllni — منصة خدمات الناصرية. اطلب أي خدمة منزلية أو مهنية بلمسة واحدة من مقدمين موثّقين بالناصرية.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Cairo:wght@400;600;700;800;900&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="css/style.css">
+</head>
+
+<body>
+
+  <header>
+    <div class="container nav">
+      <div class="logo" onclick="go('#/home')">
+        <span class="logo-mark"><svg viewBox="0 0 64 64" fill="none">
+            <circle cx="32" cy="32" r="26" fill="#fff" opacity=".15" />
+            <path d="M20 44c0-8 5-14 12-14s12 6 12 14" stroke="#fff" stroke-width="3" fill="none"
+              stroke-linecap="round" />
+            <circle cx="32" cy="22" r="6" fill="#fff" />
+            <path d="M15 50h34" stroke="#fff" stroke-width="2.5" stroke-linecap="round" />
+          </svg></span>
+        <span class="word">مدللني</span>
+      </div>
+      <nav class="nav-links" id="navLinks"></nav>
+      <div class="nav-actions" id="navActions"></div>
+    </div>
+    <div class="notif-panel" id="notifPanel"></div>
+  </header>
+
+  <main>
+    <section class="view" id="v-home">
+      <div id="homeRoot"></div>
+    </section>
+
+    <section class="view" id="v-services">
+      <div class="container">
+        <div class="page-head">
+          <h1>🧰 كتالوج <span class="hl">الخدمات</span></h1>
+          <p>كل الخدمات بأسعار مرجعية معلنة تديرها المنصة. اختر خدمتك واطلبها — أقرب مقدم موثّق متاح يقبلها.</p>
+        </div>
+        <div class="search-panel">
+          <div class="sp-row">
+            <div class="sp-search"><span class="sp-ic">🔍</span><input id="svcSearch"
+                placeholder="ابحث عن خدمة (مثلاً: تبريد، غسيل، سباكة…)" oninput="applyFilters()"></div>
+            <select id="svcSort" onchange="applyFilters()">
+              <option value="pop">الأكثر طلباً</option>
+              <option value="p-asc">السعر: من الأقل</option>
+              <option value="p-desc">السعر: من الأعلى</option>
+              <option value="name">الاسم أبجدياً</option>
+            </select>
+          </div>
+          <div class="filterbar" id="catFilters"></div>
+          <div class="sp-row sp-advanced">
+            <div class="sp-field"><label>أقل سعر (د.ع)</label><input type="number" id="fMin" placeholder="0"
+                oninput="applyFilters()"></div>
+            <div class="sp-field"><label>أعلى سعر (د.ع)</label><input type="number" id="fMax" placeholder="500000"
+                oninput="applyFilters()"></div>
+            <div class="sp-field"><label>المنطقة</label><select id="fArea" onchange="applyFilters()">
+                <option value="">كل المناطق</option>
+              </select></div>
+            <div class="sp-field"><label>الموجة</label><select id="fWave" onchange="applyFilters()">
+                <option value="">الكل</option>
+                <option value="1">إطلاق</option>
+                <option value="2">موسعة</option>
+                <option value="3">ذهبية ✨</option>
+              </select></div>
+            <button class="btn btn-ghost btn-sm" onclick="clearFilters()">مسح الفلاتر</button>
+          </div>
+          <div class="sp-count" id="svcCount"></div>
+        </div>
+        <div id="servicesList" style="padding-bottom:70px"></div>
+      </div>
+    </section>
+
+    <section class="view" id="v-how">
+      <div class="container" id="howRoot"></div>
+    </section>
+    <section class="view" id="v-pricing">
+      <div class="container" id="pricingRoot"></div>
+    </section>
+    <section class="view" id="v-auth">
+      <div class="container auth-shell" id="authRoot"></div>
+    </section>
+    <section class="view" id="v-book">
+      <div class="container book-shell" id="bookRoot"></div>
+    </section>
+    <section class="view" id="v-order">
+      <div class="container order-shell" id="orderRoot"></div>
+    </section>
+    <section class="view" id="v-account">
+      <div class="container" id="accountRoot"></div>
+    </section>
+    <section class="view" id="v-provider">
+      <div class="container" id="providerRoot"></div>
+    </section>
+    <section class="view" id="v-admin">
+      <div class="container" id="adminRoot"></div>
+    </section>
+    <section class="view" id="v-support">
+      <div class="container" id="supportRoot"></div>
+    </section>
+  </main>
+
+  <footer>
+    <div class="container foot-inner">
+      <div>
+        <div class="logo"><span class="logo-mark"><svg viewBox="0 0 64 64" fill="none">
+              <circle cx="32" cy="32" r="26" fill="#fff" opacity=".15" />
+              <path d="M20 44c0-8 5-14 12-14s12 6 12 14" stroke="#fff" stroke-width="3" fill="none"
+                stroke-linecap="round" />
+              <circle cx="32" cy="22" r="6" fill="#fff" />
+              <path d="M15 50h34" stroke="#fff" stroke-width="2.5" stroke-linecap="round" />
+            </svg></span><span class="word">مدللني</span></div>
+        <p>مدللني — منصة خدمات الناصرية. اطلب أي خدمة منزلية أو مهنية من مقدمين موثّقين. نظام تشغيل كامل يعمل ببيانات
+          حقيقية.</p>
+      </div>
+      <div>
+        <h5>المنصة</h5>
+        <a onclick="go('#/services')">الخدمات</a>
+        <a onclick="go('#/how')">كيف تعمل</a>
+        <a onclick="go('#/pricing')">العمولة والشفافية</a>
+        <a onclick="go('#/auth/register')">سجّل كمقدم خدمة</a>
+      </div>
+      <div>
+        <h5>الدعم</h5>
+        <a onclick="go('#/support')">مركز الدعم والتذاكر</a>
+        <a onclick="go('#/account')">طلباتي</a>
+        <a onclick="go('#/admin')">دخول الإدارة</a>
+      </div>
+    </div>
+    <div class="foot-bottom">مدللني mdllni © 2026 — <span class="hl">منصة خدمات الناصرية</span> · نظام تشغيل سحابي
+      متكامل</div>
+  </footer>
+
+  <div id="toast"></div>
+  <div class="modal-bg" id="modalBg">
+    <div class="modal" id="modalBox"></div>
+  </div>
+
+  <script src="js/app.js"></script>
+  <script src="js/cloud.js"></script>
+</body>
+
+</html>

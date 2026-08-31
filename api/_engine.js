@@ -1,0 +1,760 @@
+// =====================================================================
+//  مدللني mdllni — server business engine.
+//  Assembles the exact DB snapshot the frontend render code consumes,
+//  and applies every mutation with the exact same rules as the client.
+//  Uses ONLY dal.* so it runs identically in prod and in the offline test.
+// =====================================================================
+const { dal, hashPassword, verifyPassword, ENV } = require('./_lib')
+
+const STATUS_ORDER = ['pending', 'accepted', 'enroute', 'started', 'done']
+
+function toMs(x) {
+  if (x == null) return null
+  if (typeof x === 'number') return x
+  const t = new Date(x).getTime()
+  return isNaN(t) ? null : t
+}
+const nowIso = () => new Date().toISOString()
+const round = (n) => Math.round(n)
+
+// In-memory cache for static catalog tables (30s TTL) to accelerate responses
+let _staticCache = { time: 0, cats: null, services: null, settings: null }
+function clearStaticCache() { _staticCache.time = 0; }
+
+async function getCachedStatic() {
+  const now = Date.now()
+  if (_staticCache.time && (now - _staticCache.time < 30000) && _staticCache.cats && _staticCache.services && _staticCache.settings) {
+    return { cats: _staticCache.cats, services: _staticCache.services, S: _staticCache.settings }
+  }
+  const [cats, services, S] = await Promise.all([
+    dal.all('ur_categories'),
+    dal.all('ur_services'),
+    settingsMap()
+  ])
+  _staticCache = { time: now, cats, services, settings: S }
+  return { cats, services, S }
+}
+
+let _adminProvisioned = false
+async function provisionAdmin() {
+  if (_adminProvisioned) return
+  const existing = await dal.find('ur_profiles', { phone: ENV.ADMIN_PHONE })
+  if (existing) { _adminProvisioned = true; return existing }
+  const created = await dal.insert('ur_profiles', {
+    role: 'admin', name: ENV.ADMIN_NAME, phone: ENV.ADMIN_PHONE,
+    pass_hash: hashPassword(ENV.ADMIN_PASSWORD), area: 'الناصرية',
+    status: 'active', created_at: nowIso(),
+  })
+  _adminProvisioned = true
+  return created
+}
+
+// -------------------------------------------------------- small helpers
+const DEF_NASIRIYAH_AREAS = [
+  'الحبوبي / المركز', 'شارع 40', 'الإدارة المحلية', 'الحي العسكري',
+  'حي المعلمين', 'حي أريدو', 'حي الحسين', 'حي الزهراء', 'حي سومر',
+  'حي الشموخ', 'حي القادسية', 'حي التضحية', 'حي الفداء', 'حي الثورة',
+  'صوب الشامية', 'صوب الجزيرة', 'الصالحية', 'المنصورية', 'الإسكان', 'الحي الصناعي'
+];
+
+async function settingsMap() {
+  const rows = await dal.all('ur_settings')
+  const m = {}
+  for (const r of rows) m[r.key] = r.value
+  return {
+    commission: m.commission || { first: 18, standard: 15, loyal: 13, elite: 10, delivery: 10 },
+    thresholds: m.thresholds || { loyalAt: 11, eliteAt: 31, minPayout: 10000 },
+    areas: (m.areas && m.areas.length >= 10) ? m.areas : DEF_NASIRIYAH_AREAS,
+  }
+}
+async function svc(id) { return await dal.find('ur_services', { id }) }
+async function getProfile(id) { return await dal.find('ur_profiles', { id }) }
+async function getProvider(id) { return await dal.find('ur_providers', { profile_id: id }) }
+async function getOrder(id) { return await dal.find('ur_orders', { id }) }
+
+async function notify(userId, icon, text, orderId) {
+  if (!userId) return
+  await dal.insert('ur_notifications', {
+    user_id: userId, icon: icon, body: text, order_id: orderId || null,
+    read: false, created_at: nowIso(),
+  })
+}
+async function notifyAdmins(icon, text, orderId) {
+  const admins = await dal.all('ur_profiles', { role: 'admin' })
+  for (const a of admins) await notify(a.id, icon, text, orderId)
+}
+async function audit(who, action) {
+  await dal.insert('ur_audit_log', { actor: who, action: action, created_at: nowIso() })
+}
+
+function areaMatch(prov, area) {
+  const arr = prov.areas || []
+  return arr.indexOf('\u0643\u0644 \u0627\u0644\u0646\u0627\u0635\u0631\u064a\u0629') >= 0 || arr.indexOf(area) >= 0
+}
+async function providersMatching(serviceId, area, excludeId) {
+  const provs = await dal.all('ur_providers', { service_id: serviceId })
+  const out = []
+  for (const p of provs) {
+    if (p.verified !== 'verified' || !p.avail) continue
+    if (excludeId && p.profile_id === excludeId) continue
+    if (area && !areaMatch(p, area)) continue
+    const prof = await getProfile(p.profile_id)
+    if (!prof || prof.status !== 'active') continue
+    out.push(p)
+  }
+  return out
+}
+async function monthDoneCount(providerId) {
+  const done = await dal.all('ur_orders', { provider_id: providerId, status: 'done' })
+  const d = new Date(), m = d.getMonth(), y = d.getFullYear()
+  return done.filter((o) => {
+    const t = new Date(o.done_at || o.created_at)
+    return t.getMonth() === m && t.getFullYear() === y
+  }).length
+}
+async function commissionRateFor(prov, order, S) {
+  const c = S.commission
+  const s = await svc(order.service_id)
+  if (s && s.cat === 'other') return c.delivery
+  const withCustomer = (await dal.all('ur_orders', {
+    provider_id: prov.profile_id, customer_id: order.customer_id, status: 'done',
+  })).length
+  if (withCustomer === 0) return c.first
+  const month = await monthDoneCount(prov.profile_id)
+  if (month >= S.thresholds.eliteAt) return c.elite
+  if (month >= S.thresholds.loyalAt) return c.loyal
+  return c.standard
+}
+function earnings(order, S) {
+  const price = order.final_price != null ? order.final_price : order.estimate
+  const rate = order.commission_rate != null ? order.commission_rate : S.commission.standard
+  const commission = round(price * rate / 100)
+  return { price, rate, commission, net: price - commission }
+}
+
+// ------------------------------------------------------------ SNAPSHOT
+//  viewer: profile row or null. Produces a role-scoped DB object shaped
+//  EXACTLY like the frontend's localStorage DB, plus a `stats` block for
+//  public homepage aggregates.
+async function snapshot(viewer) {
+  const isAdmin = !!(viewer && viewer.role === 'admin')
+  const [staticData, profiles, providers, allOrders, reviews,
+    allMsgs, allNotes, tickets, ticketMsgs, payouts, auditRows,
+    cOrder, cTicket, cPayout] = await Promise.all([
+    getCachedStatic(),
+    dal.all('ur_profiles'), dal.all('ur_providers'), dal.all('ur_orders'),
+    dal.all('ur_reviews'), dal.all('ur_order_messages'), dal.all('ur_notifications'),
+    dal.all('ur_tickets'), dal.all('ur_ticket_messages'), dal.all('ur_payouts'),
+    dal.all('ur_audit_log'),
+    dal.find('ur_counters', { kind: 'order' }), dal.find('ur_counters', { kind: 'ticket' }),
+    dal.find('ur_counters', { kind: 'payout' }),
+  ])
+  const { cats, services, S } = staticData
+
+  const provByProfile = {}
+  for (const p of providers) provByProfile[p.profile_id] = p
+  const reviewByOrder = {}
+  for (const r of reviews) reviewByOrder[r.order_id] = r
+
+  // ---- users (global; phone masked for non-admin/non-self; pass never sent)
+  const canSeePhone = (pid) => isAdmin || (viewer && viewer.id === pid)
+  const mask = (phone) => phone ? ('•••••••' + String(phone).slice(-4)) : ''
+  const users = profiles.map((pf) => {
+    const u = {
+      id: pf.id, role: pf.role, name: pf.name,
+      phone: canSeePhone(pf.id) ? pf.phone : mask(pf.phone),
+      pass: '', area: pf.area, createdAt: toMs(pf.created_at), status: pf.status,
+    }
+    const pv = provByProfile[pf.id]
+    if (pf.role === 'provider') {
+      const pVerified = (pv && pv.verified) || 'pending'
+      let rejectReason = ''
+      let adminNote = ''
+      
+      // Sort notifications by newest first to get the most recent decision
+      const userNotes = (allNotes || [])
+        .filter(n => n.user_id === pf.id)
+        .sort((a, b) => new Date(b.created_at || 0) - new Date(a.created_at || 0))
+
+      if (pVerified === 'rejected') {
+        for (const n of userNotes) {
+          if (n.icon === '🚫' || (n.body && n.body.includes('مرفوض'))) {
+            const match = n.body.match(/السبب:\s*(.+)$/)
+            if (match) { rejectReason = match[1].trim(); break }
+          }
+        }
+      } else if (pVerified === 'verified') {
+        for (const n of userNotes) {
+          if (n.icon === '🎉' || (n.body && n.body.includes('وثّقت'))) {
+            const match = n.body.match(/ملاحظة:\s*(.+)$/)
+            if (match) { adminNote = match[1].trim(); break }
+          }
+        }
+      }
+
+      u.provider = {
+        serviceId: (pv && pv.service_id) || 's1',
+        exp: (pv && pv.exp) || 0,
+        areas: (pv && Array.isArray(pv.areas) && pv.areas.length) ? pv.areas : ['كل الناصرية', pf.area || 'الناصرية'],
+        verified: pVerified,
+        avail: pv ? pv.avail !== false : true,
+        ratingSum: (pv && pv.rating_sum) || 0,
+        ratingCount: (pv && pv.rating_count) || 0,
+        jobs: (pv && pv.jobs) || 0,
+        balance: (pv && pv.balance) || 0,
+        settled: (pv && pv.settled) || 0,
+        sensitive: pv ? !!pv.sensitive : false,
+        rejectReason: rejectReason || '',
+        adminNote: adminNote || '',
+      }
+    }
+    return u
+  })
+
+  // ---- orders (scoped)
+  const myProv = (viewer && viewer.role === 'provider') ? (provByProfile[viewer.id] || {
+    service_id: 's1', areas: ['كل الناصرية', viewer.area || 'الناصرية'], verified: 'pending', avail: true
+  }) : null
+  function orderVisible(o) {
+    if (isAdmin) return true
+    if (!viewer) return false
+    if (o.customer_id === viewer.id) return true
+    if (o.provider_id === viewer.id) return true
+    if (viewer.role === 'provider' && myProv && o.status === 'pending' &&
+        o.service_id === myProv.service_id && areaMatch(myProv, o.area) &&
+        (o.rejected_by || []).indexOf(viewer.id) < 0 && o.customer_id !== viewer.id) return true
+    return false
+  }
+  function shapeOrder(o) {
+    const rv = reviewByOrder[o.id]
+    return {
+      id: o.id, serviceId: o.service_id, customerId: o.customer_id, providerId: o.provider_id,
+      desc: o.description, area: o.area, address: o.address, when: o.when_type,
+      whenTime: o.when_time, payMethod: o.pay_method, estimate: o.estimate,
+      finalPrice: o.final_price, priceConfirmed: o.price_confirmed, status: o.status,
+      timeline: o.timeline || [], createdAt: toMs(o.created_at),
+      commissionRate: o.commission_rate == null ? null : Number(o.commission_rate),
+      review: rv ? { stars: rv.stars, text: rv.body, at: toMs(rv.created_at) } : null,
+      disputed: !!o.disputed, rejectedBy: o.rejected_by || [], doneAt: toMs(o.done_at),
+      cancelledBy: o.cancelled_by || null, cancelReason: o.cancel_reason || null,
+    }
+  }
+  const visibleOrders = allOrders.filter(orderVisible)
+  const orders = visibleOrders.map(shapeOrder)
+  const visibleOrderIds = {}
+  for (const o of visibleOrders) visibleOrderIds[o.id] = true
+
+  // ---- messages (only for visible orders)
+  const messages = allMsgs
+    .filter((m) => isAdmin || visibleOrderIds[m.order_id])
+    .map((m) => ({ id: 'm' + m.id, orderId: m.order_id, fromId: m.from_id, text: m.body, at: toMs(m.created_at) }))
+
+  // ---- notes (only mine)
+  const notes = allNotes
+    .filter((n) => viewer && n.user_id === viewer.id)
+    .map((n) => ({ id: 'n' + n.id, userId: n.user_id, icon: n.icon, text: n.body, orderId: n.order_id, at: toMs(n.created_at), read: !!n.read }))
+    .sort((a, b) => b.at - a.at)
+
+  // ---- tickets (mine, or all for admin) with embedded msgs
+  const msgsByTicket = {}
+  for (const tm of ticketMsgs) {
+    (msgsByTicket[tm.ticket_id] = msgsByTicket[tm.ticket_id] || []).push(tm)
+  }
+  const ticketsOut = tickets
+    .filter((t) => isAdmin || (viewer && t.user_id === viewer.id))
+    .map((t) => ({
+      id: t.id, userId: t.user_id, orderId: t.order_id, subject: t.subject,
+      status: t.status, at: toMs(t.created_at),
+      msgs: (msgsByTicket[t.id] || [])
+        .sort((a, b) => toMs(a.created_at) - toMs(b.created_at))
+        .map((tm) => ({ from: tm.from_id, text: tm.body, at: toMs(tm.created_at) })),
+    }))
+    .sort((a, b) => b.at - a.at)
+
+  // ---- payouts (mine / all for admin)
+  const payoutsOut = payouts
+    .filter((p) => isAdmin || (viewer && p.provider_id === viewer.id))
+    .map((p) => ({ id: p.id, providerId: p.provider_id, amount: p.amount, status: p.status, at: toMs(p.requested_at), paidAt: toMs(p.paid_at) }))
+    .sort((a, b) => b.at - a.at)
+
+  // ---- audit (admin only)
+  const auditOut = (isAdmin ? auditRows : [])
+    .map((a) => ({ at: toMs(a.created_at), who: a.actor, action: a.action }))
+    .sort((a, b) => b.at - a.at)
+
+  // ---- global stats for public homepage
+  const doneAll = allOrders.filter((o) => o.status === 'done')
+  const verifiedProvs = providers.filter((p) => {
+    if (p.verified !== 'verified') return false
+    const prof = profiles.find((x) => x.id === p.profile_id)
+    return prof && prof.status === 'active'
+  }).length
+  const ratedDone = doneAll.filter((o) => reviewByOrder[o.id])
+  const avgR = ratedDone.length
+    ? ratedDone.reduce((s, o) => s + reviewByOrder[o.id].stars, 0) / ratedDone.length : null
+  const statReviews = ratedDone
+    .sort((a, b) => toMs(reviewByOrder[b.id].created_at) - toMs(reviewByOrder[a.id].created_at))
+    .slice(0, 3)
+    .map((o) => ({
+      id: o.id, serviceId: o.service_id, customerId: o.customer_id, providerId: o.provider_id,
+      status: 'done',
+      review: { stars: reviewByOrder[o.id].stars, text: reviewByOrder[o.id].body, at: toMs(reviewByOrder[o.id].created_at) },
+    }))
+
+  const db = {
+    meta: {
+      orderSeq: cOrder ? cOrder.value + 1 : 1042,
+      userSeq: profiles.length + 1,
+      noteSeq: 1, msgSeq: 1,
+      ticketSeq: cTicket ? cTicket.value + 1 : 1,
+      payoutSeq: cPayout ? cPayout.value + 1 : 1,
+      seededAt: Date.now(),
+    },
+    settings: {
+      commission: S.commission,
+      loyalAt: S.thresholds.loyalAt, eliteAt: S.thresholds.eliteAt, minPayout: S.thresholds.minPayout,
+      areas: S.areas,
+    },
+    cats: cats.slice().sort((a, b) => (a.sort || 0) - (b.sort || 0)).map((c) => ({ id: c.id, name: c.name, icon: c.icon })),
+    services: services.map((s) => ({
+      id: s.id, icon: s.icon, name: s.name, cat: s.cat, min: s.min_price, max: s.max_price,
+      unit: s.unit, popular: !!s.popular, wave: s.wave, active: s.active !== false,
+      sensitive: !!s.sensitive, gold: !!s.gold, desc: s.description,
+    })).sort((a, b) => (parseInt(a.id.slice(1)) || 0) - (parseInt(b.id.slice(1)) || 0)),
+    users: users,
+    session: viewer ? { userId: viewer.id, at: Date.now() } : null,
+    orders: orders,
+    messages: messages,
+    notes: notes,
+    tickets: ticketsOut,
+    payouts: payoutsOut,
+    audit: auditOut,
+    stats: { verifiedProvs: verifiedProvs, doneOrders: doneAll.length, avgR: avgR, reviews: statReviews },
+  }
+  return db
+}
+
+// ------------------------------------------------------------- ACTIONS
+function need(cond, code) { if (!cond) { const e = new Error(code); e.code = code; e.status = 400; throw e } }
+function forbid(cond) { if (!cond) { const e = new Error('forbidden'); e.code = 'forbidden'; e.status = 403; throw e } }
+
+async function runAction(actor, action, p) {
+  p = p || {}
+  const S = await settingsMap()
+  const isAdmin = actor && actor.role === 'admin'
+
+  switch (action) {
+    // ---------------- customer ----------------
+    case 'createOrder': {
+      const s = await svc(p.serviceId)
+      need(s && s.active !== false, 'service_unavailable')
+      need(p.area, 'area_required')
+      need(p.estimate && p.estimate > 0, 'estimate_required')
+      const seq = await dal.nextSeq('order', 1042)
+      const id = 'UR-' + seq
+      await dal.insert('ur_orders', {
+        id: id, service_id: p.serviceId, customer_id: actor.id, provider_id: null,
+        description: p.desc || '', area: p.area, address: p.address || '',
+        when_type: p.when === 'scheduled' ? 'scheduled' : 'now', when_time: p.whenTime || null,
+        pay_method: p.payMethod === 'wallet' ? 'wallet' : 'cash', estimate: p.estimate,
+        final_price: null, price_confirmed: false, status: 'pending', commission_rate: null,
+        timeline: [{ s: 'pending', at: Date.now() }], rejected_by: [], disputed: false,
+        created_at: nowIso(),
+      })
+      const targets = await providersMatching(p.serviceId, p.area, actor.id)
+      for (const t of targets) await notify(t.profile_id, '\ud83d\udce5', '\u0637\u0644\u0628 \u062c\u062f\u064a\u062f ' + id + ' \u0628\u0645\u0646\u0637\u0642\u062a\u0643 \u2014 ' + (s ? s.name : ''), id)
+      return { orderId: id }
+    }
+    case 'confirmPrice': {
+      const o = await getOrder(p.orderId); need(o, 'order_not_found')
+      forbid(o.customer_id === actor.id || isAdmin)
+      await dal.update('ur_orders', { id: o.id }, { price_confirmed: true })
+      if (o.provider_id) await notify(o.provider_id, '\ud83d\udcb0', '\u0627\u0644\u0632\u0628\u0648\u0646 \u0648\u0627\u0641\u0642 \u0639\u0644\u0649 \u0627\u0644\u0633\u0639\u0631 \u0627\u0644\u0646\u0647\u0627\u0626\u064a \u0644\u0644\u0637\u0644\u0628 ' + o.id, o.id)
+      return {}
+    }
+    case 'rate': {
+      const o = await getOrder(p.orderId); need(o, 'order_not_found')
+      forbid(o.customer_id === actor.id)
+      need(o.status === 'done', 'order_not_done')
+      const stars = parseInt(p.stars) || 0
+      need(stars >= 1 && stars <= 5, 'bad_stars')
+      const existing = await dal.find('ur_reviews', { order_id: o.id })
+      need(!existing, 'already_rated')
+      await dal.insert('ur_reviews', { order_id: o.id, stars: stars, body: p.text || '', created_at: nowIso() })
+      const prov = await getProvider(o.provider_id)
+      if (prov) await dal.update('ur_providers', { profile_id: o.provider_id }, { rating_sum: prov.rating_sum + stars, rating_count: prov.rating_count + 1 })
+      if (o.provider_id) await notify(o.provider_id, '\u2b50', '\u062a\u0642\u064a\u064a\u0645 \u062c\u062f\u064a\u062f ' + stars + '/5 \u0639\u0644\u0649 \u0627\u0644\u0637\u0644\u0628 ' + o.id, o.id)
+      return {}
+    }
+    // ---------------- provider ----------------
+    case 'acceptOrder': {
+      const prov = await getProvider(actor.id); need(prov, 'not_provider')
+      const o = await getOrder(p.orderId); need(o && o.status === 'pending', 'order_unavailable')
+      need(prov.verified === 'verified', 'not_verified')
+      need(prov.avail, 'not_available')
+      const rate = await commissionRateFor(prov, o, S)
+      await dal.update('ur_orders', { id: o.id }, {
+        provider_id: actor.id, status: 'accepted', final_price: o.estimate,
+        price_confirmed: false, commission_rate: rate,
+        timeline: (o.timeline || []).concat([{ s: 'accepted', at: Date.now() }]),
+      })
+      await notify(o.customer_id, '\u2705', '\u0645\u0642\u062f\u0645 \u0645\u0648\u062b\u0651\u0642 \u0642\u0628\u0644 \u0637\u0644\u0628\u0643 ' + o.id + ': ' + actor.name, o.id)
+      await audit(actor.name, '\u0642\u0628\u0648\u0644 \u0627\u0644\u0637\u0644\u0628 ' + o.id)
+      return {}
+    }
+    case 'setFinalPrice': {
+      const o = await getOrder(p.orderId); need(o, 'order_not_found')
+      forbid(o.provider_id === actor.id || isAdmin)
+      const v = parseInt(p.price) || 0; need(v >= 1000, 'bad_price')
+      await dal.update('ur_orders', { id: o.id }, { final_price: v, price_confirmed: false })
+      await notify(o.customer_id, '\ud83d\udcb0', '\u0645\u0642\u062f\u0645 \u0627\u0644\u062e\u062f\u0645\u0629 \u062d\u062f\u062f \u0627\u0644\u0633\u0639\u0631 \u0627\u0644\u0646\u0647\u0627\u0626\u064a \u0644\u0644\u0637\u0644\u0628 ' + o.id + ': ' + v + ' \u062f.\u0639', o.id)
+      return {}
+    }
+    case 'advanceOrder': {
+      const o = await getOrder(p.orderId); need(o, 'order_not_found')
+      forbid(o.provider_id === actor.id || isAdmin)
+      if (o.status === 'accepted' && o.final_price != null && !o.price_confirmed) need(false, 'price_not_confirmed')
+      const i = STATUS_ORDER.indexOf(o.status); need(i >= 0 && i < STATUS_ORDER.length - 1, 'cannot_advance')
+      const next = STATUS_ORDER[i + 1]
+      const patch = { status: next, timeline: (o.timeline || []).concat([{ s: next, at: Date.now() }]) }
+      if (next === 'done') {
+        patch.done_at = nowIso()
+        const prov = await getProvider(o.provider_id)
+        const e = earnings(o, S)
+        if (prov) await dal.update('ur_providers', { profile_id: o.provider_id }, { jobs: prov.jobs + 1, balance: prov.balance + e.net })
+        await notify(o.customer_id, '\ud83c\udf89', '\u0637\u0644\u0628\u0643 ' + o.id + ' \u0627\u0643\u062a\u0645\u0644! \u0642\u064a\u0651\u0645 \u0627\u0644\u062e\u062f\u0645\u0629', o.id)
+      } else {
+        await notify(o.customer_id, '\ud83d\udd14', '\u062a\u062d\u062f\u064a\u062b \u0627\u0644\u0637\u0644\u0628 ' + o.id, o.id)
+      }
+      await dal.update('ur_orders', { id: o.id }, patch)
+      return {}
+    }
+    case 'providerDrop': {
+      const o = await getOrder(p.orderId); need(o, 'order_not_found')
+      forbid(o.provider_id === actor.id)
+      await dal.update('ur_orders', { id: o.id }, {
+        rejected_by: (o.rejected_by || []).concat([actor.id]), provider_id: null,
+        status: 'pending', final_price: null, price_confirmed: false, commission_rate: null,
+        timeline: (o.timeline || []).concat([{ s: 'pending', at: Date.now() }]),
+      })
+      await notify(o.customer_id, '\ud83d\udd04', '\u0645\u0642\u062f\u0645 \u0627\u0644\u062e\u062f\u0645\u0629 \u0627\u0639\u062a\u0630\u0631 \u0639\u0646 \u0627\u0644\u0637\u0644\u0628 ' + o.id + ' \u2014 \u0631\u062c\u0639 \u0644\u0644\u0645\u0642\u062f\u0645\u064a\u0646', o.id)
+      await audit(actor.name, '\u0627\u0639\u062a\u0630\u0627\u0631 \u0639\u0646 \u0627\u0644\u0637\u0644\u0628 ' + o.id)
+      return {}
+    }
+    case 'requestPayout': {
+      const prov = await getProvider(actor.id); need(prov, 'not_provider')
+      const amount = prov.balance
+      need(amount >= S.thresholds.minPayout, 'below_min')
+      const seq = await dal.nextSeq('payout', 1)
+      const id = 'PO-' + seq
+      await dal.insert('ur_payouts', { id: id, provider_id: actor.id, amount: amount, status: 'pending', requested_at: nowIso(), paid_at: null })
+      await dal.update('ur_providers', { profile_id: actor.id }, { balance: 0 })
+      await notifyAdmins('\ud83d\udcb8', '\u0637\u0644\u0628 \u062a\u0633\u0648\u064a\u0629 \u062c\u062f\u064a\u062f ' + id + ' \u0645\u0646 ' + actor.name + ': ' + amount + ' \u062f.\u0639', null)
+      await audit(actor.name, '\u0637\u0644\u0628 \u062a\u0633\u0648\u064a\u0629 ' + id)
+      return { payoutId: id }
+    }
+    case 'toggleAvail': {
+      const prov = await getProvider(actor.id); need(prov, 'not_provider')
+      need(prov.verified === 'verified', 'not_verified')
+      await dal.update('ur_providers', { profile_id: actor.id }, { avail: !prov.avail })
+      return { avail: !prov.avail }
+    }
+    // ---------------- shared: chat / tickets ----------------
+    case 'sendMessage': {
+      const o = await getOrder(p.orderId); need(o, 'order_not_found')
+      forbid(isAdmin || o.customer_id === actor.id || o.provider_id === actor.id)
+      const text = String(p.text || '').trim(); need(text, 'empty')
+      await dal.insert('ur_order_messages', { order_id: o.id, from_id: actor.id, body: text, created_at: nowIso() })
+      const other = actor.id === o.customer_id ? o.provider_id : o.customer_id
+      if (other) await notify(other, '\ud83d\udcac', '\u0631\u0633\u0627\u0644\u0629 \u062c\u062f\u064a\u062f\u0629 \u0628\u0627\u0644\u0637\u0644\u0628 ' + o.id, o.id)
+      return {}
+    }
+    case 'openTicket': {
+      const subject = String(p.subject || '').trim(); const body = String(p.body || '').trim()
+      need(subject.length >= 3, 'bad_subject'); need(body.length >= 5, 'bad_body')
+      const seq = await dal.nextSeq('ticket', 1); const id = 'T-' + seq
+      await dal.insert('ur_tickets', { id: id, user_id: actor.id, order_id: null, subject: subject, status: 'open', created_at: nowIso() })
+      await dal.insert('ur_ticket_messages', { ticket_id: id, from_id: actor.id, body: body, created_at: nowIso() })
+      await notifyAdmins('\ud83c\udfa7', '\u062a\u0630\u0643\u0631\u0629 \u062c\u062f\u064a\u062f\u0629 ' + id + ' \u0645\u0646 ' + actor.name, null)
+      return { ticketId: id }
+    }
+    case 'disputeOrder': {
+      const o = await getOrder(p.orderId); need(o, 'order_not_found')
+      forbid(o.customer_id === actor.id || o.provider_id === actor.id)
+      const body = String(p.body || '').trim(); need(body.length >= 5, 'bad_body')
+      await dal.update('ur_orders', { id: o.id }, { disputed: true })
+      const seq = await dal.nextSeq('ticket', 1); const id = 'T-' + seq
+      await dal.insert('ur_tickets', { id: id, user_id: actor.id, order_id: o.id, subject: '\u0646\u0632\u0627\u0639 \u0639\u0644\u0649 \u0627\u0644\u0637\u0644\u0628 ' + o.id, status: 'open', created_at: nowIso() })
+      await dal.insert('ur_ticket_messages', { ticket_id: id, from_id: actor.id, body: body, created_at: nowIso() })
+      await notifyAdmins('\u26a0\ufe0f', '\u0646\u0632\u0627\u0639 \u062c\u062f\u064a\u062f \u0639\u0644\u0649 \u0627\u0644\u0637\u0644\u0628 ' + o.id, o.id)
+      return { ticketId: id }
+    }
+    case 'replyTicket': {
+      const t = await dal.find('ur_tickets', { id: p.ticketId }); need(t, 'ticket_not_found')
+      forbid(isAdmin || t.user_id === actor.id)
+      const body = String(p.body || '').trim(); need(body, 'empty')
+      await dal.insert('ur_ticket_messages', { ticket_id: t.id, from_id: actor.id, body: body, created_at: nowIso() })
+      if (isAdmin) await notify(t.user_id, '\ud83c\udfa7', '\u0631\u062f \u0645\u0646 \u0627\u0644\u0625\u062f\u0627\u0631\u0629 \u0639\u0644\u0649 \u062a\u0630\u0643\u0631\u062a\u0643 ' + t.id, t.order_id)
+      else await notifyAdmins('\ud83c\udfa7', '\u0631\u062f \u062c\u062f\u064a\u062f \u0639\u0644\u0649 \u0627\u0644\u062a\u0630\u0643\u0631\u0629 ' + t.id, t.order_id)
+      return {}
+    }
+    case 'markAllRead': {
+      const mine = await dal.all('ur_notifications', { user_id: actor.id })
+      for (const n of mine) if (!n.read) await dal.update('ur_notifications', { id: n.id }, { read: true })
+      return {}
+    }
+    // ---------------- admin ----------------
+    case 'verifyProvider': case 'rejectProvider': case 'unverifyProvider': case 'reconsiderProvider': {
+      forbid(isAdmin)
+      const prov = await getProvider(p.userId); need(prov, 'not_provider')
+      const map = {
+        verifyProvider: 'verified',
+        rejectProvider: 'rejected',
+        unverifyProvider: 'pending',
+        reconsiderProvider: 'pending'
+      }
+      const val = map[action] || 'pending'
+      const note = String(p.note || p.reason || '').trim()
+      await dal.update('ur_providers', { profile_id: p.userId }, { verified: val })
+      const prof = await getProfile(p.userId)
+      let msg = val === 'verified'
+        ? '🎉 الإدارة وثّقت حسابك بنجاح'
+        : val === 'rejected'
+        ? '🚫 طلب التوثيق مرفوض'
+        : '⏳ أُعيد حسابك لقائمة التوثيق والمراجعة'
+      if (note) msg += (val === 'rejected' ? ' — السبب: ' + note : ' — ملاحظة: ' + note)
+      await notify(p.userId, val === 'verified' ? '🎉' : val === 'rejected' ? '🚫' : '⏳', msg, null)
+      const actionName = val === 'verified' ? 'توثيق' : val === 'rejected' ? 'رفض' : 'إعادة نظر'
+      await audit(actor.name, actionName + ' مقدم الخدمة ' + (prof ? prof.name : p.userId) + (note ? ' (' + note + ')' : ''))
+      return { status: val }
+    }
+    case 'payPayout': {
+      forbid(isAdmin)
+      const po = await dal.find('ur_payouts', { id: p.payoutId }); need(po && po.status === 'pending', 'payout_unavailable')
+      await dal.update('ur_payouts', { id: po.id }, { status: 'paid', paid_at: nowIso() })
+      const prov = await getProvider(po.provider_id)
+      if (prov) await dal.update('ur_providers', { profile_id: po.provider_id }, { settled: prov.settled + po.amount })
+      await notify(po.provider_id, '💸', 'تم اعتماد تسويتك ' + po.id + ': ' + po.amount + ' د.ع', null)
+      await audit(actor.name, 'اعتماد تسوية ' + po.id)
+      return {}
+    }
+    case 'saveSettings': {
+      forbid(isAdmin)
+      const clamp = (v, d) => Math.min(40, Math.max(0, parseInt(v) != null && !isNaN(parseInt(v)) ? parseInt(v) : d))
+      const c = p.commission || {}
+      const commission = {
+        first: clamp(c.first, S.commission.first), standard: clamp(c.standard, S.commission.standard),
+        loyal: clamp(c.loyal, S.commission.loyal), elite: clamp(c.elite, S.commission.elite),
+        delivery: clamp(c.delivery, S.commission.delivery),
+      }
+      const loyalAt = Math.max(1, parseInt(p.loyalAt) || S.thresholds.loyalAt)
+      const thresholds = {
+        loyalAt: loyalAt,
+        eliteAt: Math.max(loyalAt + 1, parseInt(p.eliteAt) || S.thresholds.eliteAt),
+        minPayout: Math.max(1000, parseInt(p.minPayout) || S.thresholds.minPayout),
+      }
+      await dal.update('ur_settings', { key: 'commission' }, { value: commission })
+      await dal.update('ur_settings', { key: 'thresholds' }, { value: thresholds })
+      clearStaticCache()
+      await audit(actor.name, 'تعديل إعدادات العمولة والتسويات')
+      return {}
+    }
+    case 'saveAreas': {
+      forbid(isAdmin)
+      const areas = Array.isArray(p.areas) ? p.areas.map(String).map(x=>x.trim()).filter(Boolean) : []
+      need(areas.length >= 2, 'bad_area')
+      await dal.update('ur_settings', { key: 'areas' }, { value: areas })
+      clearStaticCache()
+      await audit(actor.name, 'تحديث قائمة المناطق المشمولة')
+      return {}
+    }
+    case 'addService': {
+      forbid(isAdmin)
+      const name = String(p.name || '').trim(); need(name.length >= 3, 'bad_name')
+      const min = parseInt(p.min), max = parseInt(p.max); need(min && max && max >= min, 'bad_range')
+      const services = await dal.all('ur_services')
+      const maxId = services.reduce((mx, s) => Math.max(mx, parseInt(String(s.id).slice(1)) || 0), 0)
+      const id = 's' + (maxId + 1)
+      const wave = parseInt(p.wave) || 1
+      await dal.insert('ur_services', {
+        id: id, icon: p.icon || '🧰', name: name, cat: p.cat || 'other',
+        min_price: min, max_price: max, unit: p.unit || 'خدمة',
+        popular: !!p.popular, wave: wave, active: true, sensitive: !!p.sensitive,
+        gold: wave === 3, description: p.desc || name, created_at: nowIso(),
+      })
+      clearStaticCache()
+      await audit(actor.name, 'إضافة خدمة: ' + name)
+      return { serviceId: id }
+    }
+    case 'toggleService': {
+      forbid(isAdmin)
+      const s = await svc(p.serviceId); need(s, 'service_not_found')
+      await dal.update('ur_services', { id: s.id }, { active: s.active === false })
+      clearStaticCache()
+      await audit(actor.name, (s.active === false ? 'تفعيل' : 'تعطيل') + ' خدمة ' + s.name)
+      return {}
+    }
+    case 'deleteService': {
+      forbid(isAdmin)
+      const s = await svc(p.serviceId); need(s, 'service_not_found')
+      const orders = await dal.all('ur_orders', { service_id: s.id })
+      need(!orders.length, 'service_in_use')
+      await dal.del('ur_services', { id: s.id })
+      clearStaticCache()
+      await audit(actor.name, 'حذف خدمة: ' + s.name)
+      return {}
+    }
+    case 'toggleUserStatus': {
+      forbid(isAdmin)
+      const u = await getProfile(p.userId); need(u, 'user_not_found')
+      const next = u.status === 'active' ? 'suspended' : 'active'
+      await dal.update('ur_profiles', { id: u.id }, { status: next })
+      await notify(u.id, next === 'active' ? '✅' : '🚫', next === 'active' ? 'حسابك أُعيد تفعيله' : 'حسابك أُوقف', null)
+      await audit(actor.name, (next === 'active' ? 'تفعيل' : 'إيقاف') + ' حساب ' + u.name)
+      return {}
+    }
+    case 'closeTicket': {
+      forbid(isAdmin)
+      const t = await dal.find('ur_tickets', { id: p.ticketId }); need(t, 'ticket_not_found')
+      await dal.update('ur_tickets', { id: t.id }, { status: 'closed' })
+      await notify(t.user_id, '\u2705', '\u0623\u064f\u063a\u0644\u0642\u062a \u062a\u0630\u0643\u0631\u062a\u0643 ' + t.id, t.order_id)
+      await audit(actor.name, '\u0625\u063a\u0644\u0627\u0642 \u0627\u0644\u062a\u0630\u0643\u0631\u0629 ' + t.id)
+      return {}
+    }
+    // ---------------- lifecycle: reject / cancel ----------------
+    case 'rejectOrder': {
+      const prov = await getProvider(actor.id); need(prov, 'not_provider')
+      const o = await getOrder(p.orderId); need(o && o.status === 'pending', 'order_unavailable')
+      if ((o.rejected_by || []).indexOf(actor.id) < 0) {
+        await dal.update('ur_orders', { id: o.id }, { rejected_by: (o.rejected_by || []).concat([actor.id]) })
+      }
+      return {}
+    }
+    case 'cancelOrder': {
+      const o = await getOrder(p.orderId); need(o, 'order_not_found')
+      forbid(isAdmin || o.customer_id === actor.id || o.provider_id === actor.id)
+      need(o.status !== 'done' && o.status !== 'cancelled', 'order_unavailable')
+      const who = isAdmin ? '\u0627\u0644\u0625\u062f\u0627\u0631\u0629'
+        : (actor.id === o.customer_id ? '\u0627\u0644\u0632\u0628\u0648\u0646' : '\u0645\u0642\u062f\u0645 \u0627\u0644\u062e\u062f\u0645\u0629')
+      await dal.update('ur_orders', { id: o.id }, {
+        status: 'cancelled', cancelled_by: actor.id,
+        cancel_reason: '\u0623\u064f\u0644\u063a\u064a \u0628\u0648\u0627\u0633\u0637\u0629 ' + who,
+        timeline: (o.timeline || []).concat([{ s: 'cancelled', at: Date.now() }]),
+      })
+      const other = actor.id === o.customer_id ? o.provider_id : o.customer_id
+      if (other) await notify(other, '\ud83d\udeab', '\u062a\u0645 \u0625\u0644\u063a\u0627\u0621 \u0627\u0644\u0637\u0644\u0628 ' + o.id, o.id)
+      if (isAdmin) await audit(actor.name, '\u0625\u0644\u063a\u0627\u0621 \u0625\u062f\u0627\u0631\u064a \u0644\u0644\u0637\u0644\u0628 ' + o.id)
+      return {}
+    }
+    // ---------------- profile / password ----------------
+    case 'updateProfile': {
+      const name = String(p.name || '').trim(); need(name.length >= 2, 'bad_name')
+      const phone = String(p.phone || '').replace(/\s/g, ''); need(/^07[0-9]{9}$/.test(phone), 'bad_phone')
+      const area = String(p.area || actor.area || 'الحبوبي / المركز').trim()
+      const dupe = await dal.find('ur_profiles', { phone: phone })
+      need(!dupe || dupe.id === actor.id, 'phone_taken')
+      await dal.update('ur_profiles', { id: actor.id }, {
+        name: name, phone: phone, area: area,
+      })
+      return {}
+    }
+    case 'updateProviderProfile': {
+      const prov = await getProvider(actor.id); need(prov, 'not_provider')
+      const name = String(p.name || '').trim(); need(name.length >= 2, 'bad_name')
+      const phone = String(p.phone || '').replace(/\s/g, ''); need(/^07[0-9]{9}$/.test(phone), 'bad_phone')
+      const dupe = await dal.find('ur_profiles', { phone: phone })
+      need(!dupe || dupe.id === actor.id, 'phone_taken')
+      const areas = Array.isArray(p.areas) ? p.areas.map((x) => String(x).trim()).filter(Boolean) : []
+      need(areas.length >= 1, 'bad_area')
+      
+      let serviceIds = Array.isArray(p.serviceIds) ? p.serviceIds.slice(0, 3) : []
+      if (!serviceIds.length && p.serviceId) serviceIds = [p.serviceId]
+      if (!serviceIds.length) serviceIds = ['s1']
+
+      const s2 = await svc(serviceIds[0]); need(s2, 'service_not_found')
+      await dal.update('ur_profiles', { id: actor.id }, { name: name, phone: phone })
+      const patch = { service_id: s2.id, exp: Math.max(0, parseInt(p.exp) || 0), areas: areas }
+      if (s2.sensitive && !prov.sensitive) {
+        patch.sensitive = true
+        patch.verified = 'pending'
+        await notifyAdmins('🛡️', name + ' غيّر خدمته إلى خدمة حساسة — يحتاج إعادة توثيق', null)
+      }
+      await dal.update('ur_providers', { profile_id: actor.id }, patch)
+      return { reverify: !!(s2.sensitive && !prov.sensitive) }
+    }
+    case 'changePassword': {
+      const oldPass = String(p.oldPass || '')
+      const newPass = String(p.newPass || '')
+      need(verifyPassword(oldPass, actor.pass_hash), 'bad_credentials')
+      need(newPass.length >= 6, 'bad_pass')
+      await dal.update('ur_profiles', { id: actor.id }, { pass_hash: hashPassword(newPass) })
+      if (actor.role === 'admin') await audit(actor.name, 'تغيير كلمة مرور الإدارة')
+      return { ok: true }
+    }
+    // ---------------- admin: areas / delete service / notifications ----------------
+    case 'saveAreas': {
+      forbid(isAdmin)
+      const areas = Array.isArray(p.areas) ? p.areas.map((x) => String(x).trim()).filter(Boolean) : []
+      need(areas.length >= 2, 'bad_area')
+      await dal.update('ur_settings', { key: 'areas' }, { value: areas })
+      await audit(actor.name, '\u062a\u0639\u062f\u064a\u0644 \u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u0645\u0646\u0627\u0637\u0642')
+      return {}
+    }
+    case 'deleteService': {
+      forbid(isAdmin)
+      const s3 = await svc(p.serviceId); need(s3, 'service_not_found')
+      const used = await dal.all('ur_orders', { service_id: s3.id })
+      need(used.length === 0, 'service_in_use')
+      await dal.del('ur_services', { id: s3.id })
+      await audit(actor.name, '\u062d\u0630\u0641 \u062e\u062f\u0645\u0629 ' + s3.name)
+      return {}
+    }
+    case 'markRead': {
+      const num = parseInt(String(p.noteId || '').replace(/^n/, ''))
+      if (!num) return {}
+      const n = await dal.find('ur_notifications', { id: num })
+      if (n && n.user_id === actor.id && !n.read) {
+        await dal.update('ur_notifications', { id: n.id }, { read: true })
+      }
+      return {}
+    }
+    case 'reapplyVerification': {
+      const prov = await getProvider(actor.id); need(prov, 'not_provider')
+      await dal.update('ur_providers', { profile_id: actor.id }, { verified: 'pending' })
+      await notifyAdmins('🛡️', 'إعادة تقديم طلب توثيق من مقدم الخدمة: ' + actor.name, null)
+      await notify(actor.id, '⏳', 'تم استلام طلب إعادة التوثيق — قيد مراجعة الإدارة', null)
+      await audit(actor.name, 'إعادة تقديم طلب التوثيق')
+      return { status: 'pending' }
+    }
+    case 'deleteAccount': {
+      const targetId = (isAdmin && p.userId) ? p.userId : actor.id
+      const target = await getProfile(targetId); need(target, 'user_not_found')
+      need(target.role !== 'admin', 'cannot_delete_admin')
+      
+      if (!isAdmin) {
+        need(verifyPassword(String(p.pass || ''), target.pass_hash), 'bad_credentials')
+      }
+      
+      // Preserve tickets, messages, and orders: anonymize user profile and remove provider role
+      const freedPhone = '07000' + Math.floor(100000 + Math.random() * 900000);
+      await dal.update('ur_profiles', { id: target.id }, {
+        name: target.name + ' [حساب محذوف]',
+        phone: freedPhone,
+        status: 'suspended',
+        pass_hash: 'deleted_' + Date.now()
+      });
+      // Remove from providers so they no longer appear in service listings or receive jobs
+      await dal.del('ur_providers', { profile_id: target.id });
+      // Delete temporary notifications
+      await dal.del('ur_notifications', { user_id: target.id });
+      
+      await audit(actor.name, 'طلب حذف الحساب وتم أرشفة السجلات وحفظ التذاكر والمحادثات: ' + target.name + ' (' + target.phone + ')');
+      return { deleted: true };
+    }
+    default: {
+      const e = new Error('unknown_action'); e.code = 'unknown_action'; e.status = 400; throw e
+    }
+  }
+}
+
+module.exports = { snapshot, runAction, provisionAdmin, STATUS_ORDER }

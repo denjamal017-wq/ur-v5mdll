@@ -1,0 +1,19 @@
+{
+  "name": "ur-platform",
+  "version": "6.0.0",
+  "private": true,
+  "description": "منصة خدمات الناصرية — أور UR (Vercel + Supabase)",
+  "type": "commonjs",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "node test-cloud.js"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.45.0"
+  },
+  "devDependencies": {
+    "pg": "^8.23.0"
+  }
+}
