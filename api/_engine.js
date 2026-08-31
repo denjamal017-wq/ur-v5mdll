@@ -3,8 +3,8 @@
 //  Assembles the exact DB snapshot the frontend render code consumes,
 //  and applies every mutation with the exact same rules as the client.
 //  Uses ONLY dal.* so it runs identically in prod and in the offline test.
-//  v7 — النزاهة المالية: لا عهدة ولا أرصدة معلّقة. كل عمولة = ذمة موثّقة
-//  بدفتر ur_ledger، مقرّبة لوحدة 250 د.ع، وفرق التقريب يُوثَّق بالقيد.
+//  v7.1 — صلاحيات صارمة: الإلغاء للزبون/الإدارة فقط · قفل السعر بعد الموافقة
+//  · التقدير يُحسب من الكتالوج بالسيرفر · تعليم الأسعار تحت الأرضية.
 // =====================================================================
 const { dal, hashPassword, verifyPassword, ENV } = require('./_lib')
 
@@ -270,7 +270,7 @@ async function snapshot(viewer) {
       flagged: isAdmin ? !!o.flagged : false,
       review: rv ? { stars: rv.stars, text: rv.body, at: toMs(rv.created_at) } : null,
       disputed: !!o.disputed, rejectedBy: o.rejected_by || [], doneAt: toMs(o.done_at),
-      cancelledBy: o.cancelled_by || null, cancelReason: o.cancel_reason || null,
+      cancelledBy: o.cancelledBy || null, cancelReason: o.cancel_reason || null,
     }
   }
   const visibleOrders = allOrders.filter(orderVisible)
@@ -392,7 +392,8 @@ async function runAction(actor, action, p) {
       const s = await svc(p.serviceId)
       need(s && s.active !== false, 'service_unavailable')
       need(p.area, 'area_required')
-      need(p.estimate && p.estimate > 0, 'estimate_required')
+      // التقدير يُحسب من الكتالوج بالسيرفر — لا نثق بأي سعر يرسله العميل
+      const est = Math.max(1000, Math.round(((s.min_price || 0) + (s.max_price || 0)) / 2))
       // مكافحة الإغراق: حد أقصى للطلبات المفتوحة لكل زبون
       const myOpen = (await dal.all('ur_orders', { customer_id: actor.id, status: 'pending' })).length
       need(myOpen < ((S.debt && S.debt.maxOpenOrders) || 3), 'too_many_open')
@@ -414,7 +415,7 @@ async function runAction(actor, action, p) {
         id: id, service_id: p.serviceId, customer_id: actor.id, provider_id: null,
         description: p.desc || '', area: p.area, address: p.address || '',
         when_type: p.when === 'scheduled' ? 'scheduled' : 'now', when_time: p.whenTime || null,
-        pay_method: p.payMethod === 'wallet' ? 'wallet' : 'cash', estimate: p.estimate,
+        pay_method: p.payMethod === 'wallet' ? 'wallet' : 'cash', estimate: est,
         final_price: null, price_confirmed: false, status: 'pending', commission_rate: null,
         timeline: [{ s: 'pending', at: Date.now() }], rejected_by: [], disputed: false,
         flagged: flagged, created_at: nowIso(),
@@ -469,8 +470,16 @@ async function runAction(actor, action, p) {
     case 'setFinalPrice': {
       const o = await getOrder(p.orderId); need(o, 'order_not_found')
       forbid(o.provider_id === actor.id || isAdmin)
+      // السعر ينقفل بعد موافقة الزبون — وما ينعدل بعد ما يتحرك العمل
+      need(o.status === 'accepted' && !o.price_confirmed, 'price_locked')
       const v = parseInt(p.price) || 0; need(v >= 1000, 'bad_price')
       await dal.update('ur_orders', { id: o.id }, { final_price: v, price_confirmed: false })
+      // سعر تحت أرضية الكتالوج = اشتباه التفاف على العمولة → يُعلَّم للإدارة
+      const sv = await svc(o.service_id)
+      if (sv && sv.min_price && v < sv.min_price) {
+        await dal.update('ur_orders', { id: o.id }, { flagged: true })
+        await notifyAdmins('🚨', 'طلب ' + o.id + ' سُعّر بـ ' + v + ' د.ع — تحت أرضية الكتالوج (' + sv.min_price + ') — اشتباه التفاف على العمولة', o.id)
+      }
       await notify(o.customer_id, '\ud83d\udcb0', '\u0645\u0642\u062f\u0645 \u0627\u0644\u062e\u062f\u0645\u0629 \u062d\u062f\u062f \u0627\u0644\u0633\u0639\u0631 \u0627\u0644\u0646\u0647\u0627\u0626\u064a \u0644\u0644\u0637\u0644\u0628 ' + o.id + ': ' + v + ' \u062f.\u0639', o.id)
       return {}
     }
@@ -722,10 +731,11 @@ async function runAction(actor, action, p) {
     }
     case 'cancelOrder': {
       const o = await getOrder(p.orderId); need(o, 'order_not_found')
-      forbid(isAdmin || o.customer_id === actor.id || o.provider_id === actor.id)
+      // الإلغاء ملك الزبون صاحب الطلب أو الإدارة فقط — المقدم «يعتذر» (providerDrop)
+      // ويرجّع الطلب للسوق، لكنه لا يستطيع قتل طلب زبون أبداً — قاعدة سيرفر صارمة.
+      forbid(isAdmin || o.customer_id === actor.id)
       need(o.status !== 'done' && o.status !== 'cancelled', 'order_unavailable')
-      const who = isAdmin ? '\u0627\u0644\u0625\u062f\u0627\u0631\u0629'
-        : (actor.id === o.customer_id ? '\u0627\u0644\u0632\u0628\u0648\u0646' : '\u0645\u0642\u062f\u0645 \u0627\u0644\u062e\u062f\u0645\u0629')
+      const who = isAdmin ? '\u0627\u0644\u0625\u062f\u0627\u0631\u0629' : '\u0627\u0644\u0632\u0628\u0648\u0646'
       await dal.update('ur_orders', { id: o.id }, {
         status: 'cancelled', cancelled_by: actor.id,
         cancel_reason: '\u0623\u064f\u0644\u063a\u064a \u0628\u0648\u0627\u0633\u0637\u0629 ' + who,
