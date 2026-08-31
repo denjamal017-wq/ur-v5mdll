@@ -240,7 +240,7 @@ async function me(req, res) {
 
   let provider = null
   if (profile.role === 'provider') {
-    provider = await dal.find('ur_providers', { user_id: profile.id })
+    provider = await dal.find('ur_providers', { profile_id: profile.id })
   }
 
   return json(res, 200, { ok: true, user: profile, provider })
