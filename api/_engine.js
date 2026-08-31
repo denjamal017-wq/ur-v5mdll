@@ -3,8 +3,8 @@
 //  Assembles the exact DB snapshot the frontend render code consumes,
 //  and applies every mutation with the exact same rules as the client.
 //  Uses ONLY dal.* so it runs identically in prod and in the offline test.
-//  v7.3 — تنبيه «طلب بلا مقدم» · قفل الإكمال أثناء النزاع + resolveDispute
-//  · حارس confirmPrice · الحذف يتطلب ذمة صفرية · v7.2: مهن متعددة وقفل سعر شرطي.
+//  v7.4 — قبول/سداد ذريان CAS · قفل تفاؤلي للذمة · خصوصية العنوان الدقيق
+//  · عدالة الإلغاء (الزبون قبل الانطلاق فقط) · حُرّاس سباق البلاغ والتقييم.
 // =====================================================================
 const { dal, hashPassword, verifyPassword, ENV } = require('./_lib')
 
@@ -95,15 +95,23 @@ async function audit(who, action) {
 //  بدفتر ur_ledger مع الرصيد بعد كل قيد — كل دينار لازم يتفسَّر.
 //  signedAmount: موجب يرفع الذمة (عمولة/تعديل)، سالب ينزلها (سداد).
 async function applyDebt(providerId, signedAmount, kind, orderId, note) {
-  const prov = await getProvider(providerId)
-  if (!prov) return null
-  const newDebt = Math.max(0, (prov.debt || 0) + signedAmount)
-  await dal.update('ur_providers', { profile_id: providerId }, { debt: newDebt })
-  await dal.insert('ur_ledger', {
-    provider_id: providerId, order_id: orderId || null, kind: kind,
-    amount: signedAmount, balance_after: newDebt, note: note || '', created_at: nowIso(),
-  })
-  return newDebt
+  // قفل تفاؤلي: لو رصيد الذمة تغيّر بين القراءة والكتابة (طلبان يكتملان بنفس اللحظة)
+  // نعيد القراءة ونحاول — ما نفقد ولا دينار بالتحديث المتسابق
+  for (let attempt = 0; attempt < 4; attempt++) {
+    const prov = await getProvider(providerId)
+    if (!prov) return null
+    const cur = prov.debt || 0
+    const newDebt = Math.max(0, cur + signedAmount)
+    const upd = await dal.update('ur_providers', { profile_id: providerId, debt: cur }, { debt: newDebt })
+    if (upd && upd.length) {
+      await dal.insert('ur_ledger', {
+        provider_id: providerId, order_id: orderId || null, kind: kind,
+        amount: signedAmount, balance_after: newDebt, note: note || '', created_at: nowIso(),
+      })
+      return newDebt
+    }
+  }
+  const e = new Error('server_error'); e.code = 'server_error'; throw e
 }
 
 function areaMatch(prov, area) {
@@ -265,7 +273,10 @@ async function snapshot(viewer) {
     const rv = reviewByOrder[o.id]
     return {
       id: o.id, serviceId: o.service_id, customerId: o.customer_id, providerId: o.provider_id,
-      desc: o.description, area: o.area, address: o.address, when: o.when_type,
+      desc: o.description, area: o.area,
+      // الخصوصية: العنوان الدقيق يظهر فقط للأطراف والإدارة — مقدم يتصفح طلب معلّق يشوف المنطقة بس
+      address: (isAdmin || (viewer && (o.customer_id === viewer.id || o.provider_id === viewer.id))) ? o.address : '',
+      when: o.when_type,
       whenTime: o.when_time, payMethod: o.pay_method, estimate: o.estimate,
       finalPrice: o.final_price, priceConfirmed: o.price_confirmed, status: o.status,
       timeline: o.timeline || [], createdAt: toMs(o.created_at),
@@ -452,7 +463,10 @@ async function runAction(actor, action, p) {
       const provProf = o.provider_id ? await getProfile(o.provider_id) : null
       const sharedDev = provProf && (provProf.devices || []).some((d) => (actor.devices || []).indexOf(d) >= 0)
       need(!sharedDev, 'self_dealing')
-      await dal.insert('ur_reviews', { order_id: o.id, stars: stars, body: p.text || '', created_at: nowIso() })
+      const myRv = await dal.insert('ur_reviews', { order_id: o.id, stars: stars, body: p.text || '', created_at: nowIso() })
+      // حارس السباق: تقييم وحدة بس للطلب مهما ضغط الزبون بسرعة
+      const rvCount = await dal.all('ur_reviews', { order_id: o.id })
+      if (rvCount.length > 1) { await dal.del('ur_reviews', { id: myRv.id }); need(false, 'already_rated') }
       const prov = await getProvider(o.provider_id)
       if (prov) await dal.update('ur_providers', { profile_id: o.provider_id }, { rating_sum: prov.rating_sum + stars, rating_count: prov.rating_count + 1 })
       if (o.provider_id) await notify(o.provider_id, '\u2b50', '\u062a\u0642\u064a\u064a\u0645 \u062c\u062f\u064a\u062f ' + stars + '/5 \u0639\u0644\u0649 \u0627\u0644\u0637\u0644\u0628 ' + o.id, o.id)
@@ -470,11 +484,13 @@ async function runAction(actor, action, p) {
       // بوابة الذمة: من تجاوز حد الإيقاف ما يستلم طلبات حتى يسدّد
       need((prov.debt || 0) < ((S.debt && S.debt.blockAt) || 50000), 'debt_blocked')
       const rate = await commissionRateFor(prov, o, S)
-      await dal.update('ur_orders', { id: o.id }, {
+      // CAS: قبول ذري — لو مقدم ثاني سبق بالمللي ثانية، التحديث يفشل وما يصير تمزّق
+      const accepted = await dal.update('ur_orders', { id: o.id, status: 'pending' }, {
         provider_id: actor.id, status: 'accepted', final_price: o.estimate,
         price_confirmed: false, commission_rate: rate,
         timeline: (o.timeline || []).concat([{ s: 'accepted', at: Date.now() }]),
       })
+      need(accepted.length > 0, 'order_unavailable')
       await notify(o.customer_id, '\u2705', '\u0645\u0642\u062f\u0645 \u0645\u0648\u062b\u0651\u0642 \u0642\u0628\u0644 \u0637\u0644\u0628\u0643 ' + o.id + ': ' + actor.name, o.id)
       await audit(actor.name, '\u0642\u0628\u0648\u0644 \u0627\u0644\u0637\u0644\u0628 ' + o.id)
       return {}
@@ -538,6 +554,7 @@ async function runAction(actor, action, p) {
         timeline: (o.timeline || []).concat([{ s: 'pending', at: Date.now() }]),
       })
       await notify(o.customer_id, '\ud83d\udd04', '\u0645\u0642\u062f\u0645 \u0627\u0644\u062e\u062f\u0645\u0629 \u0627\u0639\u062a\u0630\u0631 \u0639\u0646 \u0627\u0644\u0637\u0644\u0628 ' + o.id + ' \u2014 \u0631\u062c\u0639 \u0644\u0644\u0645\u0642\u062f\u0645\u064a\u0646', o.id)
+      await notifyAdmins('🔄', 'مقدم اعتذر عن الطلب ' + o.id + ' بعد استلامه — ' + actor.name, o.id)
       await audit(actor.name, '\u0627\u0639\u062a\u0630\u0627\u0631 \u0639\u0646 \u0627\u0644\u0637\u0644\u0628 ' + o.id)
       return {}
     }
@@ -552,6 +569,9 @@ async function runAction(actor, action, p) {
       const seq = await dal.nextSeq('payout', 1)
       const id = 'ST-' + seq
       await dal.insert('ur_payouts', { id: id, provider_id: actor.id, amount: amount, status: 'pending', direction: 'settlement', requested_at: nowIso(), paid_at: null })
+      // حارس الدبل-كليك: لو انفتح أكثر من بلاغ بنفس اللحظة (سباق) — نلغي الزائد فوراً
+      const pendNow = await dal.all('ur_payouts', { provider_id: actor.id, status: 'pending' })
+      if (pendNow.length > 1) { await dal.del('ur_payouts', { id: id }); need(false, 'payout_unavailable') }
       await notifyAdmins('💵', 'بلاغ سداد ذمة ' + id + ' من ' + actor.name + ': ' + amount + ' د.ع — يحتاج تأكيد استلام', null)
       await audit(actor.name, 'بلاغ سداد ' + id)
       return { settlementId: id }
@@ -560,7 +580,9 @@ async function runAction(actor, action, p) {
       forbid(isAdmin)
       const po = await dal.find('ur_payouts', { id: p.payoutId }); need(po && po.status === 'pending', 'payout_unavailable')
       const prof = await getProfile(po.provider_id)
-      await dal.update('ur_payouts', { id: po.id }, { status: 'paid', paid_at: nowIso() })
+      // CAS: التأكيد مرة وحدة بس — دبل-كليك أو سباق ما يخصم الذمة مرتين
+      const paidRows = await dal.update('ur_payouts', { id: po.id, status: 'pending' }, { status: 'paid', paid_at: nowIso() })
+      need(paidRows.length > 0, 'payout_unavailable')
       // السداد يخفّض الذمة ويُقيد بالدفتر — ماكو خصم بدون قيد
       const nd = await applyDebt(po.provider_id, -po.amount, 'payment', null, 'تأكيد استلام سداد ' + po.id)
       await notify(po.provider_id, '✅', 'استلمنا دفعتك ' + po.amount + ' د.ع — ذمتك المتبقية ' + (nd == null ? 0 : nd) + ' د.ع', null)
@@ -760,6 +782,8 @@ async function runAction(actor, action, p) {
       // ويرجّع الطلب للسوق، لكنه لا يستطيع قتل طلب زبون أبداً — قاعدة سيرفر صارمة.
       forbid(isAdmin || o.customer_id === actor.id)
       need(o.status !== 'done' && o.status !== 'cancelled', 'order_unavailable')
+      // الزبون يلغي فقط قبل انطلاق المقدم — بعدها الإلغاء للإدارة (عدالة الطرفين)
+      if (!isAdmin) need(o.status === 'pending' || o.status === 'accepted', 'order_unavailable')
       const who = isAdmin ? '\u0627\u0644\u0625\u062f\u0627\u0631\u0629' : '\u0627\u0644\u0632\u0628\u0648\u0646'
       await dal.update('ur_orders', { id: o.id }, {
         status: 'cancelled', cancelled_by: actor.id,
