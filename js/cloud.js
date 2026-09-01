@@ -1,7 +1,7 @@
 /* ================= UR v6 — طبقة السحابة (Vercel + Supabase) =================
    كل إجراء يروح للسيرفر ويتخزن بقاعدة البيانات — ماكو شي وهمي أبداً.
-   v8.3 — مصفوفة صلاحيات + رؤية المعلق + واجهة الذمة + قفل شرطي للسعر +
-          حسم النزاع للإدارة + الرجوع للتقديري + شارة الاستجابة. */
+   v8 — تصحيح المنطق: مصفوفة صلاحيات صفحة الطلب (المقدم ما يلغي أبداً) +
+        رؤية الطلبات المعلقة للمقدم + واجهة الذمة المالية + إصلاح نص مكسور. */
 (function(){
 'use strict';
 
@@ -59,7 +59,7 @@ var ERR={
   order_not_found:'\u26a0\ufe0f الطلب غير موجود',
   order_unavailable:'\u26a0\ufe0f الطلب ما عاد متاحاً',
   order_not_done:'\u26a0\ufe0f لازم يكتمل الطلب أولاً',
-  price_not_confirmed:'\u26a0\ufe0f الزبون لازم يوافق على السعر المخصص أولاً',
+  price_not_confirmed:'\u26a0\ufe0f الزبون لازم يوافق على السعر النهائي أولاً',
   price_locked:'\u26a0\ufe0f السعر انقفل بعد موافقة الزبون — ما ينعدل',
   cannot_advance:'\u26a0\ufe0f ما يمكن تقديم حالة الطلب الآن',
   bad_price:'\u26a0\ufe0f أدخل سعراً صحيحاً من مضاعفات 250 د.ع',
@@ -86,7 +86,8 @@ var ERR={
   overpay:'\u26a0\ufe0f المبلغ أكبر من ذمتك الحالية',
   cannot_delete_admin:'\ud83d\udeab لا يمكن حذف حساب الإدارة',
   disputed_open:'\u2696\ufe0f الطلب عليه نزاع مفتوح — ما يكتمِل حتى تُحسم الإدارة',
-  cancel_abuse:'\ud83d\udeab إلغاءات متكررة خلال 24 ساعة — الطلبات متوقفة مؤقتاً حمايةً لوقت المقدمين'
+  cancel_abuse:'\ud83d\udeab إلغاءات متكررة خلال 24 ساعة — الطلبات متوقفة مؤقتاً حمايةً لوقت المقدمين',
+  extra_pending:'\u26a0\ufe0f أكو إضافات بانتظار موافقة الزبون — تُحسم أو تُسحب قبل الإكمال'
 };
 function errMsg(code){ return ERR[code] || ('\u26a0\ufe0f صار خطأ' + (code?(' ('+code+')'):'')); }
 
@@ -201,6 +202,18 @@ function installCloud(){
   // v8.3 — المقدم يرجّع السعر المخصص للتقديري ويفك الجمود بنفسه
   window.revertToEstimate = wrap('revertToEstimate', function(id){ return {orderId:id}; },
     function(r,id){ toast('\u21ba رجّعت الطلب للسعر التقديري — تكدر تكمل فوراً'); renderOrder(id); });
+
+  // v8.4 — الأعمال الإضافية الميدانية: اقتراح بسعر ← موافقة/رفض الزبون ← سحب المقدم
+  window.addExtraAsk = function(id){
+    openModal('➕ إضافة عمل إضافي ميداني', '<div class="field"><label>وصف العمل الإضافي</label><input id="exDesc" placeholder="مثلاً: تبديل سيفون إضافي اكتشفته بالفحص"></div><div class="field"><label>المبلغ (د.ع — مضاعفات 250)</label><input id="exAmount" type="number" min="250" step="250" placeholder="5000"></div><div class="hint" style="font-size:12px;color:var(--faint)">الإضافة ما تنحسب ولا تدخل بالعمولة إلا بعد موافقة الزبون — موثّقة بالوصف والمبلغ والوقت.</div>', '➕ إرسال للزبون', function(){ addExtra(id); });
+  };
+  window.addExtra = wrap('addExtra',
+    function(id){ var d=$('exDesc').value.trim(); var v=parseInt($('exAmount').value,10); if(d.length<3){ toast('اكتب وصف الإضافة'); return ABORT; } if(!v||v<250||v%250!==0){ toast('\u26a0\ufe0f أدخل مبلغاً من مضاعفات 250 د.ع'); return ABORT; } return {orderId:id, desc:d, amount:v}; },
+    function(r,id){ closeModal(); toast('➕ انرسلت الإضافة للزبون — بانتظار موافقته'); renderOrder(id); });
+  window.respondExtra = wrap('respondExtra', function(orderId, extraId, approve){ return {orderId:orderId, extraId:extraId, approve:approve}; },
+    function(r,orderId){ toast('✓ تم تسجيل ردّك على الإضافة'); renderOrder(orderId); renderHeader(currentRoute().name); });
+  window.withdrawExtra = wrap('withdrawExtra', function(orderId, extraId){ return {orderId:orderId, extraId:extraId}; },
+    function(r,orderId){ toast('↩️ سحبت الإضافة — تكدر تكمل بالسعر الأساسي'); renderOrder(orderId); });
 
   // v8.2 — إيراد المنصة يُحسب من العمولات الموثّقة المقرّبة (مو التقديرية)
   window.platformRevenue = function(){
@@ -504,6 +517,9 @@ function installCloud(){
   const isCust=o.customerId===u.id, isProv=o.providerId===u.id, isAdm=u.role==='admin';
   const isProvPendingViewer = !isCust && !isProv && !isAdm && u.role==='provider' && o.status==='pending' && (o.rejectedBy||[]).indexOf(u.id)<0;
   const priceCustom = o.finalPrice!=null && o.finalPrice!==o.estimate; // قفل الموافقة فقط إذا المقدم خصّص السعر
+  const apprList=(o.extras||[]).filter(x=>x.status==='approved');
+  const apprExtras=apprList.reduce((s,x)=>s+x.amount,0);
+  const apprCount=apprList.length;
 
   let topHtml='';
   if(o.status==='cancelled'){
@@ -525,9 +541,21 @@ function installCloud(){
     priceCard='<div class="order-card"><h4>💰 السعر والعمولة</h4>'
       +'<div class="detail-row"><span>السعر التقديري</span><b>'+fmt(o.estimate)+' د.ع</b></div>'
       +'<div class="detail-row"><span>السعر النهائي</span><b>'+(o.finalPrice!=null?fmt(o.finalPrice)+' د.ع':'—')+(priceCustom?(o.priceConfirmed?' <span class="chip chip-green">✓ وافق عليه الزبون</span>':' <span class="chip chip-amber">بانتظار موافقة الزبون</span>'):'')+'</b></div>'
+      +(apprExtras?'<div class="detail-row"><span>➕ إضافات معتمدة ('+apprCount+')</span><b>+ '+fmt(apprExtras)+' د.ع</b></div>':'')
       +(isProv||isAdm? '<div class="detail-row"><span>عمولة المنصة ('+rateVal+'%)</span><b>− '+fmt(comm)+' د.ع</b></div>'
         +(o.roundingDelta?'<div class="detail-row"><span style="font-size:12px">فرق التقريب (وحدة 250 د.ع)</span><b style="font-size:12.5px;color:var(--muted)">'+(o.roundingDelta>0?'+':'')+o.roundingDelta+' د.ع — موثّق بدفتر الذمة</b></div>':'')
         +'<div class="detail-row"><span>صافي المقدم</span><b style="color:var(--ok)">'+fmt(Math.max(0,price-comm))+' د.ع</b></div>' : '')
+      +'</div>';
+  }
+
+  // بطاقة الإضافات الميدانية — كل عمل زيادة موثّق بوصف وسعر وموافقة
+  let extrasCard='';
+  const exList=(o.extras||[]);
+  if(exList.length){
+    extrasCard='<div class="order-card"><h4>➕ أعمال إضافية ميدانية ('+exList.length+')</h4>'
+      +exList.map(ex=>'<div class="detail-row"><span>'+esc(ex.desc)+'<br><span style="font-size:11.5px;color:var(--faint)">'+ex.id+' · '+fmtD(ex.at)+'</span></span><b>'+fmt(ex.amount)+' د.ع '+(ex.status==='pending'?'<span class="chip chip-amber">⏳ بانتظار الزبون</span>':ex.status==='approved'?'<span class="chip chip-green">✓ موافق عليها</span>':ex.status==='rejected'?'<span class="chip chip-red">🚫 مرفوضة</span>':'<span class="chip chip-gray">↩️ مسحوبة</span>')+'</b></div>'
+      +(isCust&&ex.status==='pending'?'<div style="display:flex;gap:8px;margin:4px 0 10px"><button class="btn btn-primary btn-sm" onclick="respondExtra(\''+o.id+'\',\''+ex.id+'\',true)">✓ أوافق</button><button class="btn btn-ghost btn-sm" onclick="respondExtra(\''+o.id+'\',\''+ex.id+'\',false)">✗ أرفض</button></div>':'')
+      +(isProv&&ex.status==='pending'?'<div style="margin:4px 0 10px"><button class="btn btn-ghost btn-sm" onclick="withdrawExtra(\''+o.id+'\',\''+ex.id+'\')">↩️ سحب الإضافة</button></div>':'')).join('')
       +'</div>';
   }
 
@@ -543,6 +571,7 @@ function installCloud(){
     const i=STATUS_ORDER.indexOf(o.status);
     if(o.status==='accepted') actions+='<button class="btn btn-outline btn-sm" onclick="setFinalPriceAsk(\''+o.id+'\')">💰 عدّل السعر النهائي</button>';
     if(o.status==='accepted'&&priceCustom&&!o.priceConfirmed) actions+='<button class="btn btn-ghost btn-sm" onclick="revertToEstimate(\''+o.id+'\')">↺ ارجع للسعر التقديري</button>';
+    if(['accepted','enroute','started'].includes(o.status)) actions+='<button class="btn btn-outline btn-sm" onclick="addExtraAsk(\''+o.id+'\')">➕ عمل إضافي</button>';
     if(i>0&&i<STATUS_ORDER.length-1){ const next=STATUS_ORDER[i+1]; actions+='<button class="btn btn-primary btn-sm" onclick="advanceOrder(\''+o.id+'\')">'+(next==='done'?'🎉 أكمل الخدمة':'التالي: '+stInfo(next).label)+'</button>'; }
     // المقدم يعتذر بأي مرحلة نشطة — الطلب يرجع للسوق وما ينلغي أبداً بيده
     if(['accepted','enroute','started'].includes(o.status)) actions+='<button class="btn btn-danger btn-sm" onclick="providerDrop(\''+o.id+'\')">اعتذار عن الطلب</button>';
@@ -598,6 +627,7 @@ function installCloud(){
   </div>
   ${p?'<div class="order-card"><h4>🧑‍🔧 مقدم الخدمة</h4><div style="display:flex;align-items:center;gap:13px"><div class="avatar">'+initials(p.name)+'</div><div><b style="font-size:15.5px">'+esc(p.name)+' '+(isVerifiedProv(p)?'<span class="stamp">✓ موثّق</span>':'')+'</b><div style="font-size:13px;color:var(--muted);margin-top:3px">'+stars(provRating(p)||0)+' '+provRatingTxt(p)+' · '+(p.provider.jobs||0)+' طلب مكتمل · '+p.provider.exp+' سنوات خبرة</div></div></div></div>':''}
   ${priceCard}
+  ${extrasCard}
   ${chatBox}
   ${rateBox}
   ${actions?'<div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:6px">'+actions+'</div>':''}
