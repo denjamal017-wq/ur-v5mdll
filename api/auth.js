@@ -18,18 +18,59 @@ function normalizePhone(p) {
 const PHONE_RE = /^07[0-9]{9}$/
 
 // Anti-Fraud Device & IP Tracking: Ban any IP or Device registering > 3 phone numbers
-const _ipRegistrations = new Map()       // ip -> Set of phones
-const _deviceRegistrations = new Map()   // deviceId -> Set of phones
+// v7.4 — العدّادات والحظر دائمة بجدول ur_rate_limits: السيرفرليس ينسى الذاكرة عند كل cold start
+// وكل instance لها عدّادها — القاعدة هي مصدر الحقيقة، والذاكرة كاش سريع فوقها.
 const _bannedIps = new Set()
 const _bannedDevices = new Set()
-const _loginFails = new Map()   // ip -> { count, first } — كبح المحاولات المتكررة
 
-function noteLoginFail(ip) {
-  const t = Date.now()
-  const cur = _loginFails.get(ip)
-  if (!cur || (t - cur.first) >= 600000) _loginFails.set(ip, { count: 1, first: t })
-  else cur.count++
+async function rlGet(key) {
+  try { return await dal.find('ur_rate_limits', { key: key }) } catch (_) { return null }
 }
+async function rlSet(key, count, first, items) {
+  const row = { count: count, first: first, items: items || [], updated_at: new Date().toISOString() }
+  try {
+    const ex = await dal.find('ur_rate_limits', { key: key })
+    if (ex) await dal.update('ur_rate_limits', { key: key }, row)
+    else await dal.insert('ur_rate_limits', Object.assign({ key: key }, row))
+  } catch (_) {}
+}
+async function isBanned(ip, deviceId) {
+  if (_bannedIps.has(ip) || _bannedDevices.has(deviceId)) return true
+  const [b1, b2] = await Promise.all([rlGet('ban:ip:' + ip), rlGet('ban:dev:' + deviceId)])
+  if (b1) _bannedIps.add(ip)
+  if (b2) _bannedDevices.add(deviceId)
+  return !!(b1 || b2)
+}
+async function banBoth(ip, deviceId) {
+  _bannedIps.add(ip); _bannedDevices.add(deviceId)
+  await rlSet('ban:ip:' + ip, 1, Date.now(), [])
+  await rlSet('ban:dev:' + deviceId, 1, Date.now(), [])
+  console.warn('[SECURITY FRAUD ALERT] Banned IP ' + ip + ' and Device ' + deviceId + ' for registering > 3 phone numbers!')
+}
+async function regPhones(key) {
+  const row = await rlGet(key)
+  return (row && Array.isArray(row.items)) ? row.items : []
+}
+async function noteRegistration(ip, deviceId, phone) {
+  for (const key of ['reg:ip:' + ip, 'reg:dev:' + deviceId]) {
+    const items = await regPhones(key)
+    if (items.indexOf(phone) < 0) {
+      items.push(phone)
+      await rlSet(key, items.length, Date.now(), items.slice(-20))
+    }
+  }
+}
+async function loginFailCount(ip) {
+  const row = await rlGet('lf:' + ip)
+  if (!row || (Date.now() - (row.first || 0)) >= 600000) return 0
+  return row.count || 0
+}
+async function noteLoginFail(ip) {
+  const row = await rlGet('lf:' + ip)
+  const fresh = !row || (Date.now() - (row.first || 0)) >= 600000
+  await rlSet('lf:' + ip, fresh ? 1 : (row.count || 0) + 1, fresh ? Date.now() : row.first, [])
+}
+async function clearLoginFails(ip) { await rlSet('lf:' + ip, 0, 0, []) }
 
 function getClientIp(req) {
   const xf = req.headers['x-forwarded-for']
@@ -37,13 +78,13 @@ function getClientIp(req) {
   return req.headers['x-real-ip'] || req.socket?.remoteAddress || '127.0.0.1'
 }
 
-function checkDeviceFraud(req, body, phone) {
+async function checkDeviceFraud(req, body, phone) {
   const ip = getClientIp(req)
   const rawDev = String(body.deviceId || body.deviceFingerprint || req.headers['user-agent'] || 'unknown_device').trim()
   const deviceId = rawDev.slice(0, 120)
 
-  // 1. Check if IP or Device is already banned
-  if (_bannedIps.has(ip) || _bannedDevices.has(deviceId)) {
+  // 1. Check if IP or Device is already banned (القاعدة مصدر الحقيقة)
+  if (await isBanned(ip, deviceId)) {
     return {
       blocked: true,
       error: 'device_blocked',
@@ -51,19 +92,11 @@ function checkDeviceFraud(req, body, phone) {
     }
   }
 
-  // 2. Track registered phone numbers for this IP
-  if (!_ipRegistrations.has(ip)) _ipRegistrations.set(ip, new Set())
-  const ipPhones = _ipRegistrations.get(ip)
-
-  // 3. Track registered phone numbers for this Device
-  if (!_deviceRegistrations.has(deviceId)) _deviceRegistrations.set(deviceId, new Set())
-  const devPhones = _deviceRegistrations.get(deviceId)
-
-  // If already registered 3 distinct phone numbers and trying to register a 4th new number -> BAN IP & Device!
-  if ((ipPhones.size >= 3 && !ipPhones.has(phone)) || (devPhones.size >= 3 && !devPhones.has(phone))) {
-    _bannedIps.add(ip)
-    _bannedDevices.add(deviceId)
-    console.warn(`[SECURITY FRAUD ALERT] Banned IP ${ip} and Device ${deviceId} for registering > 3 phone numbers!`)
+  // 2. تتبع التسجيلات الدائم: 3 أرقام مختلفة كحد أقصى لكل IP/جهاز — والرابع يحظرهما
+  const ipPhones = await regPhones('reg:ip:' + ip)
+  const devPhones = await regPhones('reg:dev:' + deviceId)
+  if ((ipPhones.length >= 3 && ipPhones.indexOf(phone) < 0) || (devPhones.length >= 3 && devPhones.indexOf(phone) < 0)) {
+    await banBoth(ip, deviceId)
     return {
       blocked: true,
       error: 'device_blocked',
@@ -71,7 +104,7 @@ function checkDeviceFraud(req, body, phone) {
     }
   }
 
-  return { blocked: false, ip, deviceId, ipPhones, devPhones }
+  return { blocked: false, ip, deviceId }
 }
 
 module.exports = async function handler(req, res) {
@@ -102,8 +135,8 @@ async function register(res, b, req) {
   if (pass.length < 6) return json(res, 400, { ok: false, error: 'bad_pass' })
   if (!area) return json(res, 400, { ok: false, error: 'bad_area' })
 
-  // Anti-Fraud check: Check IP & Device limits (Auto-ban on > 3 accounts)
-  const fraudCheck = checkDeviceFraud(req, b, phone)
+  // Anti-Fraud check: Check IP & Device limits (Auto-ban on > 3 accounts) — دائم بالقاعدة
+  const fraudCheck = await checkDeviceFraud(req, b, phone)
   if (fraudCheck.blocked) {
     return json(res, 403, { ok: false, error: fraudCheck.error, message: fraudCheck.message })
   }
@@ -122,10 +155,11 @@ async function register(res, b, req) {
 
     for (const sId of serviceIds) {
       if (sId === 'custom' || (sId === serviceIds[0] && b.customServiceName)) {
-        const customName = String(b.customServiceName || 'مهنة خاصة').trim()
-        const customDesc = String(b.customServiceDesc || 'خدمة مخصصة').trim()
-        const minPrice = Math.max(1000, parseInt(b.customServiceMin, 10) || 10000)
-        const maxPrice = Math.max(minPrice, parseInt(b.customServiceMax, 10) || 40000)
+        // v7.4 — حدود صارمة للمهنة المخصصة: اسم بطول معقول وسعر ضمن سقف منطقي
+        const customName = String(b.customServiceName || 'مهنة خاصة').trim().slice(0, 60) || 'مهنة خاصة'
+        const customDesc = String(b.customServiceDesc || 'خدمة مخصصة').trim().slice(0, 200)
+        const minPrice = Math.min(500000, Math.max(1000, parseInt(b.customServiceMin, 10) || 10000))
+        const maxPrice = Math.min(500000, Math.max(minPrice, parseInt(b.customServiceMax, 10) || 40000))
         const customId = 'svc_' + Date.now().toString(36)
         try {
           const sRow = await dal.insert('ur_services', {
@@ -163,20 +197,28 @@ async function register(res, b, req) {
   }
 
   const passHash = await hashPassword(pass)
-  const profile = await dal.insert('ur_profiles', {
-    phone,
-    role,
-    name,
-    area,
-    status: 'active',
-    pass_hash: passHash,
-    // نخزّن بصمة الجهاز من أول لحظة — أساس كشف التعامل الذاتي لاحقاً
-    devices: fraudCheck.deviceId ? [fraudCheck.deviceId] : []
-  })
+  // سباق التسجيل المزدوج: القيد الفريد على الهاتف يحسم — نرجّع phone_taken نظيفة بدل 500
+  let profile
+  try {
+    profile = await dal.insert('ur_profiles', {
+      phone,
+      role,
+      name,
+      area,
+      status: 'active',
+      pass_hash: passHash,
+      // نخزّن بصمة الجهاز من أول لحظة — أساس كشف التعامل الذاتي لاحقاً
+      devices: fraudCheck.deviceId ? [fraudCheck.deviceId] : []
+    })
+  } catch (e) {
+    if (String((e && e.message) || '').indexOf('duplicate') >= 0) {
+      return json(res, 409, { ok: false, error: 'phone_taken' })
+    }
+    throw e
+  }
 
-  // Record successful registration for IP and Device tracking
-  if (fraudCheck.ipPhones) fraudCheck.ipPhones.add(phone)
-  if (fraudCheck.devPhones) fraudCheck.devPhones.add(phone)
+  // Record successful registration for IP and Device tracking (دائم بالقاعدة)
+  await noteRegistration(fraudCheck.ip, fraudCheck.deviceId, phone)
 
   if (role === 'provider') {
     const areas = Array.isArray(b.areas) && b.areas.length ? b.areas : [area]
@@ -188,7 +230,8 @@ async function register(res, b, req) {
       service_ids: selectedServiceIds,
       exp: exp,
       areas: areas,
-      verified: sensitive ? 'pending' : 'verified',
+      // v7.4 — بوابة الثقة: كل مقدم ينتظر توثيق الإدارة بلا استثناء (الواجهة تَعِد بذلك والثقة أساس المنصة)
+      verified: 'pending',
       avail: true,
       sensitive: sensitive
     })
@@ -200,7 +243,7 @@ async function register(res, b, req) {
         await dal.insert('ur_notifications', {
           user_id: a.id,
           icon: '👷',
-          body: `انضمام مقدم خدمة جديد: ${name} (${selectedServiceIds.length} مهن: ${primaryServiceRow.name}) — منطقة ${area}`,
+          body: `مقدم خدمة جديد ينتظر التوثيق: ${name} (${selectedServiceIds.length} مهن: ${primaryServiceRow.name}) — منطقة ${area}`,
           read: false,
           created_at: new Date().toISOString()
         })
@@ -220,8 +263,8 @@ async function login(res, b, req) {
   const ip = getClientIp(req)
   const deviceId = String(b.deviceId || b.deviceFingerprint || req.headers['user-agent'] || 'unknown_device').trim().slice(0, 120)
 
-  // Check if IP or device is banned
-  if (_bannedIps.has(ip) || _bannedDevices.has(deviceId)) {
+  // Check if IP or device is banned (القاعدة مصدر الحقيقة)
+  if (await isBanned(ip, deviceId)) {
     return json(res, 403, {
       ok: false,
       error: 'device_blocked',
@@ -229,20 +272,20 @@ async function login(res, b, req) {
     })
   }
 
-  // Anti brute-force: 6 محاولات فاشلة خلال 10 دقائق من نفس الـ IP → إيقاف مؤقت
-  const _lf = _loginFails.get(ip)
-  if (_lf && _lf.count >= 6 && (Date.now() - _lf.first) < 600000) {
+  // Anti brute-force: 6 محاولات فاشلة خلال 10 دقائق من نفس الـ IP → إيقاف مؤقت (عداد دائم بالقاعدة)
+  const failCount = await loginFailCount(ip)
+  if (failCount >= 6) {
     return json(res, 429, { ok: false, error: 'device_blocked', message: '🚫 محاولات دخول كثيرة — انتظر شوية وحاول من جديد' })
   }
 
   const profile = await dal.find('ur_profiles', { phone })
-  if (!profile) { noteLoginFail(ip); return json(res, 401, { ok: false, error: 'not_registered' }) }
+  if (!profile) { await noteLoginFail(ip); return json(res, 401, { ok: false, error: 'not_registered' }) }
   if (profile.status === 'suspended') return json(res, 403, { ok: false, error: 'suspended' })
 
   const ok = await verifyPassword(pass, profile.pass_hash)
-  if (!ok) { noteLoginFail(ip); return json(res, 401, { ok: false, error: 'bad_credentials' }) }
+  if (!ok) { await noteLoginFail(ip); return json(res, 401, { ok: false, error: 'bad_credentials' }) }
 
-  _loginFails.delete(ip) // دخول ناجح يصفّر العداد
+  await clearLoginFails(ip) // دخول ناجح يصفّر العداد
   // نلحق بصمة الجهاز بكل دخول ناجح (آخر 10 أجهزة) — كشف التعامل الذاتي
   const devs = Array.from(new Set([].concat(profile.devices || [], [deviceId]))).slice(-10)
   try { await dal.update('ur_profiles', { id: profile.id }, { devices: devs }) } catch (_) {}
