@@ -5,6 +5,10 @@
 //  Uses ONLY dal.* so it runs identically in prod and in the offline test.
 //  v7.1 — صلاحيات صارمة: الإلغاء للزبون/الإدارة فقط · قفل السعر بعد الموافقة
 //  · التقدير يُحسب من الكتالوج بالسيرفر · تعليم الأسعار تحت الأرضية.
+//  v7.8 — CAS على انتقالات الحالة (العمولة تُقيد مرة واحدة مهما تسابق الضغط) + استشفاء ذاتي
+//  · الاعتذار للطلبات النشطة فقط ويمسح إضافات السابق · تعليم تراكمي للإضافات
+//  · تعليم فوق سقف الكتالوج · أي مهنة حساسة (مو بس الأولى) تفرض إعادة توثيق
+//  · التعامل الذاتي يدخل rejected_by (يُخفى ويُرفض) · دفتر الإدارة 200 قيد.
 // =====================================================================
 const { dal, hashPassword, verifyPassword, ENV } = require('./_lib')
 
@@ -104,10 +108,20 @@ async function applyDebt(providerId, signedAmount, kind, orderId, note) {
     const newDebt = Math.max(0, cur + signedAmount)
     const upd = await dal.update('ur_providers', { profile_id: providerId, debt: cur }, { debt: newDebt })
     if (upd && upd.length) {
-      await dal.insert('ur_ledger', {
-        provider_id: providerId, order_id: orderId || null, kind: kind,
-        amount: signedAmount, balance_after: newDebt, note: note || '', created_at: nowIso(),
-      })
+      try {
+        await dal.insert('ur_ledger', {
+          provider_id: providerId, order_id: orderId || null, kind: kind,
+          amount: signedAmount, balance_after: newDebt, note: note || '', created_at: nowIso(),
+        })
+      } catch (e) {
+        // v7.8 — حارس الفهرس الفريد: قيد عمولة لهذا الطلب مسجل أصلاً بسباق.
+        // نعكس حركة الذمة حتى يبقى الرصيد = مجموع الدفتر ديناراً بدينار.
+        if (String((e && e.message) || '').indexOf('duplicate') >= 0) {
+          await dal.update('ur_providers', { profile_id: providerId, debt: newDebt }, { debt: cur })
+          return cur
+        }
+        throw e
+      }
       return newDebt
     }
   }
@@ -353,11 +367,11 @@ async function snapshot(viewer) {
     .map((a) => ({ at: toMs(a.created_at), who: a.actor, action: a.action }))
     .sort((a, b) => b.at - a.at)
 
-  // ---- ledger (mine / all for admin) — آخر 50 قيد
+  // ---- ledger (mine / all for admin) — الإدارة تشوف 200 قيد (دفتر محاسبي كامل) والمقدم آخر 50
   const ledgerOut = (ledgerRows || [])
     .filter((l) => isAdmin || (viewer && l.provider_id === viewer.id))
     .sort((a, b) => toMs(b.created_at) - toMs(a.created_at))
-    .slice(0, 50)
+    .slice(0, isAdmin ? 200 : 50)
     .map((l) => ({ id: 'l' + l.id, orderId: l.order_id, kind: l.kind, amount: l.amount, balanceAfter: l.balance_after, note: l.note, at: toMs(l.created_at) }))
 
   // ---- global stats for public homepage
@@ -442,15 +456,17 @@ async function runAction(actor, action, p) {
       const seq = await dal.nextSeq('order', 1042)
       const id = 'UR-' + seq
       // كشف التعامل الذاتي: تطابق بصمة جهاز الزبون مع جهاز أي مقدم مطابق
-      // → الطلب يُعلَّم للإدارة ويُخفى عن ذلك المقدم تحديداً
+      // → الطلب يُعلَّم للإدارة ويُخفى ع�� ذلك المق��م تحديداً
       const myDevices = actor.devices || []
       let flagged = false
       const matched = await providersMatching(p.serviceId, p.area, actor.id)
       const targets = []
+      // v7.8 — المطابق بجهاز مشترك يُستبعد نهائياً من هذا الطلب (rejected_by): ما ينُخطر، ما يشوفه، وما يكدر يقبله
+      const sharedIds = []
       for (const t of matched) {
         const tp = await getProfile(t.profile_id)
         const shared = tp && (tp.devices || []).some((d) => myDevices.indexOf(d) >= 0)
-        if (shared) flagged = true
+        if (shared) { flagged = true; sharedIds.push(t.profile_id) }
         else targets.push(t)
       }
       await dal.insert('ur_orders', {
@@ -459,7 +475,7 @@ async function runAction(actor, action, p) {
         when_type: p.when === 'scheduled' ? 'scheduled' : 'now', when_time: p.whenTime || null,
         pay_method: p.payMethod === 'wallet' ? 'wallet' : 'cash', estimate: est,
         final_price: null, price_confirmed: false, status: 'pending', commission_rate: null,
-        timeline: [{ s: 'pending', at: Date.now() }], rejected_by: [], disputed: false,
+        timeline: [{ s: 'pending', at: Date.now() }], rejected_by: sharedIds, disputed: false,
         flagged: flagged, created_at: nowIso(),
       })
       if (flagged) await notifyAdmins('🚨', 'طلب ' + id + ' مُعلَّم: تطابق بصمة جهاز الزبون مع جهاز مقدم خدمة مطابق (اشتباه تعامل ذاتي)', id)
@@ -504,6 +520,8 @@ async function runAction(actor, action, p) {
       const o = await getOrder(p.orderId); need(o && o.status === 'pending', 'order_unavailable')
       need(prov.verified === 'verified', 'not_verified')
       need(prov.avail, 'not_available')
+      // v7.8 — من تجاهل/اعتذر/انكشف بتعامل ذاتي ما يلتقط نفس الطلب من السيرفر (مو بس تُخفيه الواجهة)
+      need((o.rejected_by || []).indexOf(actor.id) < 0, 'order_unavailable')
       // لا قبول خارج نطاق مهنه ومناطقه — الصلاحية على السيرفر مو بس بالواجهة
       const provSvcIds = (Array.isArray(prov.service_ids) && prov.service_ids.length) ? prov.service_ids : [prov.service_id]
       need(provSvcIds.indexOf(o.service_id) >= 0 && areaMatch(prov, o.area), 'forbidden')
@@ -537,6 +555,11 @@ async function runAction(actor, action, p) {
         await dal.update('ur_orders', { id: o.id }, { flagged: true })
         await notifyAdmins('🚨', 'طلب ' + o.id + ' سُعّر بـ ' + v + ' د.ع — تحت أرضية الكتالوج (' + sv.min_price + ') — اشتباه التفاف على العمولة', o.id)
       }
+      // v7.8 — وسعر فوق سقف الكتالوج يُعلَّم أيضاً: ضغط على الزبون أو خطأ جسيم (حماية إنسانية)
+      if (sv && sv.max_price && v > sv.max_price) {
+        await dal.update('ur_orders', { id: o.id }, { flagged: true })
+        await notifyAdmins('🚨', 'طلب ' + o.id + ' سُعّر بـ ' + v + ' د.ع — فوق سقف الكتالوج (' + sv.max_price + ') — راجع قبل أن يوافق الزبون', o.id)
+      }
       await notify(o.customer_id, '\ud83d\udcb0', '\u0645\u0642\u062f\u0645 \u0627\u0644\u062e\u062f\u0645\u0629 \u062d\u062f\u062f \u0627\u0644\u0633\u0639\u0631 \u0627\u0644\u0646\u0647\u0627\u0626\u064a \u0644\u0644\u0637\u0644\u0628 ' + o.id + ': ' + v + ' \u062f.\u0639', o.id)
       return {}
     }
@@ -563,35 +586,63 @@ async function runAction(actor, action, p) {
       await dal.update('ur_orders', { id: o.id }, { extras: extras.concat([ex]) })
       await notify(o.customer_id, '➕', 'مقدم الخدمة اقترح عملاً إضافياً على طلبك ' + o.id + ': ' + desc + ' — ' + amount + ' د.ع — وافق أو ارفض', o.id)
       await audit(actor.name, 'اقترح إضافة ' + ex.id + ' على ' + o.id + ' (' + amount + ' د.ع)')
-      // إضافة تتجاوز ضعف قيمة الطلب = غير معتادة → تُعلَّم للإدارة
-      const curTotal = (o.final_price != null ? o.final_price : o.estimate) + extrasTotal(o)
-      if (amount > curTotal * 2) {
+      // v7.8 — تعليم مزدوج: إضافة أضخم من ضعف المجموع الحالي، أو تراكم يتجاوز قيمة الأساسي
+      const baseTotal = (o.final_price != null ? o.final_price : o.estimate)
+      const curTotal = baseTotal + extrasTotal(o)
+      const extrasAfter = extrasTotal(o) + amount
+      if (amount > curTotal * 2 || extrasAfter > baseTotal) {
         await dal.update('ur_orders', { id: o.id }, { flagged: true })
-        await notifyAdmins('🚨', 'إضافة غير معتادة على الطلب ' + o.id + ': ' + amount + ' د.ع (ضعف قيمة الطلب تقريباً) — راجع التفاصيل', o.id)
+        await notifyAdmins('🚨', (amount > curTotal * 2
+          ? 'إضافة غير معتادة على الطلب ' + o.id + ': ' + amount + ' د.ع (ضعف قيمة الطلب تقريباً)'
+          : 'إضافات تراكمية على الطلب ' + o.id + ' تجاوزت قيمة الأساسي: ' + extrasAfter + ' د.ع من أصل ' + baseTotal) + ' — راجع التفاصيل', o.id)
       }
       return { extraId: ex.id }
     }
     case 'respondExtra': {
-      const o = await getOrder(p.orderId); need(o, 'order_not_found')
-      forbid(o.customer_id === actor.id)
-      const extras = o.extras || []
-      const ex = extras.find((x) => x.id === p.extraId); need(ex, 'order_not_found')
-      need(ex.status === 'pending', 'order_unavailable')
+      // v7.8 — حلقة idempotent ضد السباق: لو سحبها المقدم بنفس اللحظة نرجّع الحقيقة الحالية بدل ضياع الكتابة
       const approve = !!p.approve
-      ex.status = approve ? 'approved' : 'rejected'
-      await dal.update('ur_orders', { id: o.id }, { extras: extras })
-      if (o.provider_id) await notify(o.provider_id, approve ? '✅' : '🚫', 'الزبون ' + (approve ? 'وافق على' : 'رفض') + ' الإضافة «' + ex.desc + '» (' + ex.amount + ' د.ع) — طلب ' + o.id, o.id)
-      return { status: ex.status }
+      let settled = null
+      for (let attempt = 0; attempt < 3 && !settled; attempt++) {
+        const o = await getOrder(p.orderId); need(o, 'order_not_found')
+        forbid(o.customer_id === actor.id)
+        const extras = o.extras || []
+        const ex = extras.find((x) => x.id === p.extraId); need(ex, 'order_not_found')
+        if (ex.status !== 'pending') return { status: ex.status }
+        ex.status = approve ? 'approved' : 'rejected'
+        await dal.update('ur_orders', { id: o.id }, { extras: extras })
+        const chk = await getOrder(o.id)
+        const chkEx = chk && (chk.extras || []).find((x) => x.id === p.extraId)
+        if (chkEx && chkEx.status !== 'pending') {
+          if (chkEx.status === ex.status) settled = chkEx
+          else return { status: chkEx.status }
+        }
+      }
+      need(settled, 'server_error')
+      const oDone = await getOrder(p.orderId)
+      if (oDone && oDone.provider_id) await notify(oDone.provider_id, approve ? '✅' : '🚫', 'الزبون ' + (approve ? 'وافق على' : 'رفض') + ' الإضافة «' + settled.desc + '» (' + settled.amount + ' د.ع) — طلب ' + p.orderId, p.orderId)
+      return { status: settled.status }
     }
     case 'withdrawExtra': {
-      const o = await getOrder(p.orderId); need(o, 'order_not_found')
-      forbid(o.provider_id === actor.id)
-      const extras = o.extras || []
-      const ex = extras.find((x) => x.id === p.extraId); need(ex, 'order_not_found')
-      need(ex.status === 'pending', 'order_unavailable')
-      ex.status = 'withdrawn'
-      await dal.update('ur_orders', { id: o.id }, { extras: extras })
-      await notify(o.customer_id, '↩️', 'مقدم الخدمة سحب الإضافة المقترحة «' + ex.desc + '» من طلبك ' + o.id, o.id)
+      // v7.8 — نفس حلقة respondExtra ضد السباق
+      let settled = null
+      for (let attempt = 0; attempt < 3 && !settled; attempt++) {
+        const o = await getOrder(p.orderId); need(o, 'order_not_found')
+        forbid(o.provider_id === actor.id)
+        const extras = o.extras || []
+        const ex = extras.find((x) => x.id === p.extraId); need(ex, 'order_not_found')
+        if (ex.status !== 'pending') return { status: ex.status }
+        ex.status = 'withdrawn'
+        await dal.update('ur_orders', { id: o.id }, { extras: extras })
+        const chk = await getOrder(o.id)
+        const chkEx = chk && (chk.extras || []).find((x) => x.id === p.extraId)
+        if (chkEx && chkEx.status !== 'pending') {
+          if (chkEx.status === 'withdrawn') settled = chkEx
+          else return { status: chkEx.status }
+        }
+      }
+      need(settled, 'server_error')
+      const oDone = await getOrder(p.orderId)
+      if (oDone) await notify(oDone.customer_id, '↩️', 'مقدم الخدمة سحب الإضافة المقترحة «' + settled.desc + '» من طلبك ' + oDone.id, oDone.id)
       return {}
     }
     case 'advanceOrder': {
@@ -606,13 +657,32 @@ async function runAction(actor, action, p) {
       // إكمال وكو إضافة معلّقة = عمولة ناقصة — الزبون يوافق/يرفض أو المقدم يسحب أولاً
       if (next === 'done' && (o.extras || []).some((x) => x.status === 'pending')) need(false, 'extra_pending')
       const patch = { status: next, timeline: (o.timeline || []).concat([{ s: next, at: Date.now() }]) }
+      let e = null
       if (next === 'done') {
         patch.done_at = nowIso()
-        const prov = await getProvider(o.provider_id)
-        const e = earnings(o, S)
+        e = earnings(o, S)
         // التوثيق المحاسبي الكامل على الطلب نفسه
         patch.commission_amount = e.commission
         patch.rounding_delta = e.delta
+      }
+      // v7.8 — CAS على الانتقال نفسه: التحديث ينجح فقط إذا الحالة ما زالت كما قرأناها.
+      // من يربح السباق ينفّذ التأثيرات، والخاسر يتحقق ويكتفي — العمولة تُقيد مرة واحدة مهما تكرر الضغط.
+      const advanced = await dal.update('ur_orders', { id: o.id, status: o.status }, patch)
+      if (!advanced.length) {
+        const cur = await getOrder(o.id)
+        need(cur && cur.status === next, 'cannot_advance')
+        if (next === 'done' && cur.commission_amount != null && cur.provider_id) {
+          // استشفاء ذاتي: لو الفائز تحطّم قبل قيد العمولة — نسجّلها هنا مرة واحدة (الفهرس الفريد حارس)
+          await new Promise((r) => setTimeout(r, 350))
+          const led = await dal.all('ur_ledger', { order_id: o.id, kind: 'commission' })
+          if (!led.length) {
+            await applyDebt(cur.provider_id, cur.commission_amount, 'commission', o.id, 'عمولة الطلب ' + o.id + ' (استكمال تلقائي بعد سباق)')
+          }
+        }
+        return {}
+      }
+      if (next === 'done') {
+        const prov = await getProvider(o.provider_id)
         if (prov) {
           await dal.update('ur_providers', { profile_id: o.provider_id }, { jobs: prov.jobs + 1 })
           // العمولة تصير ذمة موثّقة — المنصة ما تدفع ولا تستلم، تسجّل فقط
@@ -625,20 +695,26 @@ async function runAction(actor, action, p) {
           }
         }
         await notify(o.customer_id, '\ud83c\udf89', '\u0637\u0644\u0628\u0643 ' + o.id + ' \u0627\u0643\u062a\u0645\u0644! \u0642\u064a\u0651\u0645 \u0627\u0644\u062e\u062f\u0645\u0629', o.id)
+        // v7.8 — كل عمولة توصل الإدارة لحظتها: شفافية حية للمؤسس (ومنين جت: الطلب + المقدم + القيمة)
+        await notifyAdmins('🧾', 'عمولة موثقة ' + e.commission + ' د.ع (' + e.rate + '%) — طلب ' + o.id + ' — ' + actor.name + (extrasTotal(o) > 0 ? ' — تشمل إضافات ' + extrasTotal(o) + ' د.ع' : ''), o.id)
       } else {
         await notify(o.customer_id, '\ud83d\udd14', '\u062a\u062d\u062f\u064a\u062b \u0627\u0644\u0637\u0644\u0628 ' + o.id, o.id)
       }
-      await dal.update('ur_orders', { id: o.id }, patch)
       return {}
     }
     case 'providerDrop': {
       const o = await getOrder(p.orderId); need(o, 'order_not_found')
       forbid(o.provider_id === actor.id)
-      await dal.update('ur_orders', { id: o.id }, {
+      // v7.8 — الاعتذار مسموح فقط بمرحلة نشطة: طلب مكتمل أو ملغي ما يرجع للسوق أبداً
+      need(['accepted', 'enroute', 'started'].indexOf(o.status) >= 0, 'order_unavailable')
+      // CAS: لو الطلب تغيّر بين القراءة والكتابة نرفض — وإضافات المقدم السابق تُمسح معه (الملتقط يفاوض من الصفر)
+      const dropped = await dal.update('ur_orders', { id: o.id, status: o.status }, {
         rejected_by: (o.rejected_by || []).concat([actor.id]), provider_id: null,
         status: 'pending', final_price: null, price_confirmed: false, commission_rate: null,
+        extras: [],
         timeline: (o.timeline || []).concat([{ s: 'pending', at: Date.now() }]),
       })
+      need(dropped.length > 0, 'order_unavailable')
       await notify(o.customer_id, '\ud83d\udd04', '\u0645\u0642\u062f\u0645 \u0627\u0644\u062e\u062f\u0645\u0629 \u0627\u0639\u062a\u0630\u0631 \u0639\u0646 \u0627\u0644\u0637\u0644\u0628 ' + o.id + ' \u2014 \u0631\u062c\u0639 \u0644\u0644\u0645\u0642\u062f\u0645\u064a\u0646', o.id)
       // نمط الاعتذارات: كل 3 اعتذارات تراكمية → تنبيه مراجعة أداء للإدارة
       const provD = await getProvider(actor.id)
@@ -932,16 +1008,26 @@ async function runAction(actor, action, p) {
       if (!serviceIds.length && p.serviceId) serviceIds = [p.serviceId]
       if (!serviceIds.length) serviceIds = ['s1']
 
+      // v7.8 — كل مهنة تُتحقق من الكتالوج: الوهمية تُستبعد، وأي حساسة (مو بس الأولى) تفرض إعادة توثيق
+      const validIds = []
+      let anySensitive = false
+      for (const sid of serviceIds) {
+        const sr = await svc(sid)
+        if (sr) { validIds.push(sr.id); if (sr.sensitive) anySensitive = true }
+      }
+      need(validIds.length >= 1, 'service_not_found')
+      serviceIds = validIds
+
       const s2 = await svc(serviceIds[0]); need(s2, 'service_not_found')
       await dal.update('ur_profiles', { id: actor.id }, { name: name, phone: phone })
       const patch = { service_id: s2.id, service_ids: serviceIds, exp: Math.max(0, parseInt(p.exp) || 0), areas: areas }
-      if (s2.sensitive && !prov.sensitive) {
+      if (anySensitive && !prov.sensitive) {
         patch.sensitive = true
         patch.verified = 'pending'
-        await notifyAdmins('🛡️', name + ' غيّر خدمته إلى خدمة حساسة — يحتاج إعادة توثيق', null)
+        await notifyAdmins('🛡️', name + ' أضاف خدمة حساسة لملفه — يحتاج إعادة توثيق قبل استقبال الطلبات', null)
       }
       await dal.update('ur_providers', { profile_id: actor.id }, patch)
-      return { reverify: !!(s2.sensitive && !prov.sensitive) }
+      return { reverify: !!(anySensitive && !prov.sensitive) }
     }
     case 'changePassword': {
       const oldPass = String(p.oldPass || '')
@@ -964,7 +1050,8 @@ async function runAction(actor, action, p) {
     case 'reapplyVerification': {
       const prov = await getProvider(actor.id); need(prov, 'not_provider')
       await dal.update('ur_providers', { profile_id: actor.id }, { verified: 'pending' })
-      await notifyAdmins('🛡️', 'إعادة تقديم طلب توثيق من مقدم الخدمة: ' + actor.name, null)
+      const svcRow = prov ? await svc(prov.service_id) : null
+      await notifyAdmins('🛡️', 'إعادة تقديم طلب توثيق: ' + actor.name + ' — ' + (svcRow ? svcRow.name : 'خدمة') + ' — ' + (actor.area || 'الناصرية'), null)
       await notify(actor.id, '⏳', 'تم استلام طلب إعادة التوثيق — قيد مراجعة الإدارة', null)
       await audit(actor.name, 'إعادة تقديم طلب التوثيق')
       return { status: 'pending' }
