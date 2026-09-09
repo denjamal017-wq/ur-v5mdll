@@ -163,7 +163,11 @@ function installCloud(){
     function(id){ var t=$('tkInput').value.trim(); if(!t) return ABORT; return {ticketId:id, body:t}; },
     function(r,id){ renderSupport(id); renderHeader(currentRoute().name); });
 
-  window.markAllRead = wrap('markAllRead', function(){ return {}; }, function(r){ renderHeader(); });
+  // v8.5 — «تعيين الكل كمقروء» يحدّث اللوحة المفتوحة فوراً (مو بس شارة الجرس)
+  window.markAllRead = wrap('markAllRead', function(){ return {}; }, function(r){
+    renderHeader();
+    var np=$('notifPanel'); if(np && np.classList.contains('open') && typeof renderNotifs==='function') renderNotifs();
+  });
 
   window.verifyProvider = wrap('verifyProvider',
     function(id, note){ return {userId:id, note:note||''}; },
@@ -263,7 +267,7 @@ function installCloud(){
 
   window.saveProviderProfile = function(){
     var name = ($('pvfName') ? $('pvfName').value : '').trim();
-    var rawPhone = $('pvfPhone') ? $('pvfPhone').value : '';
+    var rawPhone = ($('pvfPhone') ? $('pvfPhone').value : '');
     var phone = normalizePhone(rawPhone);
     var areas = Array.prototype.slice.call(document.querySelectorAll('.pvfArea:checked')).map(function(c){return c.value;});
     var exp = parseInt($('pvfExp') ? $('pvfExp').value : '0', 10) || 0;
@@ -720,7 +724,6 @@ function installCloud(){
         +(verified&&u.provider.avail
           ? '<button class="btn btn-primary btn-sm" onclick="acceptOrder(\''+o.id+'\')">✓ قبول الطلب</button>'
           : '<button class="btn btn-primary btn-sm" disabled title="'+(verified?'فعّل التوفر من الجانب':'ينتظر توثيق الإدارة')+'">✓ قبول الطلب</button>')
-        +(cust&&cust.phone?'<a class="btn btn-ghost btn-sm" href="tel:'+esc(cust.phone)+'">📞 اتصال بالزبون</a>':'')
         +'<button class="btn btn-ghost btn-sm" onclick="go(\'#/order/'+o.id+'\')">📄 التفاصيل</button>'
         +'<button class="btn btn-ghost btn-sm" onclick="rejectOrder(\''+o.id+'\')">✗ تجاهل</button></div></div>';
     });
@@ -850,7 +853,7 @@ function installCloud(){
       +'<div class="field"><label>كلمة المرور الحالية</label><input id="pwOld" type="password" placeholder="••••••••"></div>'
       +'<div class="field"><label>الجديدة (6+ أحرف)</label><input id="pwNew" type="password" placeholder="••••••••"></div>'
       +'</div><button class="btn btn-outline btn-sm" onclick="changePass()">تغيير كلمة المرور</button></div>'
-      +'<div class="card" style="margin-top:16px;border:1.5px solid rgba(220,38,38,.3);background:rgba(220,38,38,.02)"><h4 style="font-size:16px;font-weight:900;color:var(--danger);margin-bottom:8px">🚨 منطقة الخطر — إدارة الحساب</h4><p style="font-size:13.5px;color:var(--muted);margin-bottom:14px">عند حذف الحساب، سيتم إزالة ملفك وسجلاتك نهائياً من المنصة.</p><button class="btn btn-danger btn-sm" onclick="askDeleteAccount()">🗑️ طلب حذف الحساب نهائياً</button></div>';
+      +'<div class="card" style="margin-top:16px;border:1.5px solid rgba(220,38,38,.3);background:rgba(220,38,38,.02)"><h4 style="font-size:16px;font-weight:900;color:var(--danger);margin-bottom:8px">�� منطقة الخطر — إدارة الحساب</h4><p style="font-size:13.5px;color:var(--muted);margin-bottom:14px">عند حذف الحساب، سيتم إزالة ملفك وسجلاتك نهائياً من المنصة.</p><button class="btn btn-danger btn-sm" onclick="askDeleteAccount()">🗑️ طلب حذف الحساب نهائياً</button></div>';
   }
 
   const svcsTitle = allMySvcs.length > 1
@@ -900,7 +903,48 @@ function installCloud(){
   </div>`;
   };
 
+  /* ============ v8.5 — لوحة الأدمن: جدول «آخر العمولات المحصلة» بكل معلومات الطلب من القيم الموثّقة ============ */
+  var _origRenderAdmin = window.renderAdmin;
+  window.renderAdmin = function(tab){
+    if(typeof _origRenderAdmin==='function') _origRenderAdmin(tab);
+    if(tab==='finance') upgradeFinanceCommissions();
+  };
+
   installModePill();
+}
+
+// v8.5 — يعيد بناء جدول عمولات الأدمن بعد العرض: كل معلومات الطلب + القيم الموثقة من الدفتر (مو حساب محلي)
+function upgradeFinanceCommissions(){
+  var root=$('adminRoot'); if(!root) return;
+  var heads=root.querySelectorAll('h3'), target=null;
+  for(var i=0;i<heads.length;i++){ if(heads[i].textContent.indexOf('آخر العمولات المحصلة')>=0){ target=heads[i]; break; } }
+  if(!target) return;
+  var doneOrders=(DB.orders||[]).filter(function(o){return o&&o.status==='done';}).sort(function(a,b){return ((b.doneAt||b.createdAt)||0)-((a.doneAt||a.createdAt)||0);});
+  target.textContent='🧮 آخر العمولات المحصلة ('+doneOrders.length+')';
+  var rows=doneOrders.slice(0,20).map(function(o){
+    var e=earningsOf(o);
+    var extrasSum=(o.extras||[]).filter(function(x){return x.status==='approved';}).reduce(function(s,x){return s+x.amount;},0);
+    var price=orderPrice(o)+extrasSum;
+    var comm=(o.commissionAmount!=null)?o.commissionAmount:e.commission;
+    var rateV=(o.commissionRate!=null)?o.commissionRate:e.rate;
+    var cust=userById(o.customerId), pv=o.providerId?userById(o.providerId):null;
+    var os=svc(o.serviceId);
+    return '<tr'+(o.flagged?' style="background:rgba(220,38,38,.05)"':'')+'>'
+      +'<td><b><a style="color:var(--ink);text-decoration:underline;cursor:pointer" onclick="go(\'#/order/'+o.id+'\')">'+o.id+'</a></b>'+(o.flagged?'<br><span class="chip chip-red" style="font-size:10.5px;padding:1px 7px">🚨 معلَّم</span>':'')+'</td>'
+      +'<td style="white-space:nowrap">'+os.icon+' '+esc(os.name)+'</td>'
+      +'<td>'+esc(cust?cust.name:'—')+' <span style="color:var(--faint)">←</span> '+esc(pv?pv.name:'—')+'</td>'
+      +'<td>'+esc(o.area||'—')+'</td>'
+      +'<td style="white-space:nowrap">'+fmtDT(o.doneAt||o.createdAt)+'</td>'
+      +'<td style="white-space:nowrap">'+fmt(price)+(extrasSum?'<br><span style="font-size:11px;color:var(--muted)">أساسي '+fmt(orderPrice(o))+' + إضافات '+fmt(extrasSum)+'</span>':'')+'</td>'
+      +'<td>'+rateV+'%</td>'
+      +'<td style="color:var(--ok);font-weight:800">'+fmt(comm)+(o.roundingDelta?'<br><span style="font-size:10.5px;color:var(--faint)">تقريب موثّق '+(o.roundingDelta>0?'+':'')+o.roundingDelta+'</span>':'')+'</td>'
+      +'<td>'+fmt(Math.max(0,price-comm))+'</td></tr>';
+  }).join('');
+  var html=doneOrders.length
+    ? '<div class="hint" style="font-size:12.5px;color:var(--faint);margin:-6px 0 12px">قيم موثّقة من دفتر الذمة لحظة الإنجاز — العمولة على الأساسي + الإضافات المعتمدة، وفرق التقريب معلن. اضغط رقم الطلب لفتح ملفه الكامل.</div><div class="table-wrap"><table class="ptable"><tr><th>الطلب</th><th>الخدمة</th><th>الزبون ← المقدم</th><th>المنطقة</th><th>أُنجز</th><th>السعر الموثّق</th><th>الشريحة</th><th>العمولة الموثّقة</th><th>صافي المقدم</th></tr>'+rows+'</table></div>'
+    : '<div class="empty card"><span class="ic">🧮</span>لا عمولات بعد — تظهر بعد أول طلب مكتمل.</div>';
+  var sib=target.nextElementSibling;
+  if(sib && (sib.classList.contains('table-wrap')||sib.classList.contains('empty'))) sib.outerHTML=html;
 }
 
 function installModePill(){
