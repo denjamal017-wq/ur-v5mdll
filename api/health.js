@@ -1,5 +1,5 @@
 // GET /api/health — lets the frontend detect cloud vs local mode.
-const { cloudReady, cors } = require('./_lib')
+const { cloudReady, cors, ENV } = require('./_lib')
 
 module.exports = function handler(req, res) {
   cors(res)
@@ -10,7 +10,10 @@ module.exports = function handler(req, res) {
     ok: true,
     mode: cloudReady ? 'cloud' : 'local',
     service: 'ur-platform',
-    version: 'v6',
+    version: 'v8',
+    // v8.0 — إعدادات عامة يحتاجها العميل قبل الدخول (مفاتيح علنية فقط، بلا أسرار)
+    turnstileSiteKey: ENV.TURNSTILE_SITE_KEY || '',
+    mailReady: !!ENV.MAIL_API_KEY,
     time: new Date().toISOString(),
   }))
 }

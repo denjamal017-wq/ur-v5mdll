@@ -1,6 +1,13 @@
-// POST /api/auth  { action: 'register' | 'login' | 'me', ... }
-const { cors, json, readBody, dal, hashPassword, verifyPassword, signToken, getToken, verifyToken } = require('./_lib')
+// POST /api/auth  { action: 'register' | 'login' | 'verifyOtp' | 'resendOtp' | 'me', ... }
+//  v8.0 — هوية أقوى بكثير:
+//  · بريد إلزامي + رمز OTP بخطوتين للتسجيل والدخول (بدل الاعتماد على الهاتف فقط)
+//  · جهاز واحد = حساب واحد (فهرس فريد بالقاعدة) — الجهاز الجديد لحساب قائم
+//    يحتاج رمز بريد ثم موافقة الإدارة (تبديل الهاتف العطلان بدون فقدان الحساب)
+//  · آخر IP موثّق للحساب (شبكة مكافحة التواطؤ بالمحرك) + أحداث أمنية دائمة
+//  · Cloudflare Turnstile اختياري عند ضبط المفاتيح + كبح القوة الغاشمة الدائم
+const { cors, json, readBody, dal, hashPassword, verifyPassword, signToken, getToken, verifyToken, verifyTurnstile, crypto, ENV } = require('./_lib')
 const { provisionAdmin } = require('./_engine')
+const { sendOtpEmail } = require('./_mail')
 
 function normalizePhone(p) {
   if (!p) return ''
@@ -16,10 +23,13 @@ function normalizePhone(p) {
 }
 
 const PHONE_RE = /^07[0-9]{9}$/
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/
+const OTP_TTL_MS = 10 * 60 * 1000
+const OTP_MAX_ATTEMPTS = 5
+const OTP_RESEND_COOLDOWN_MS = 60 * 1000
+const OTP_DAILY_LIMIT = 8
 
-// Anti-Fraud Device & IP Tracking: Ban any IP or Device registering > 3 phone numbers
-// v7.4 — العدّادات والحظر دائمة بجدول ur_rate_limits: السيرفرليس ينسى الذاكرة عند كل cold start
-// وكل instance لها عدّادها — القاعدة هي مصدر الحقيقة، والذاكرة كاش سريع فوقها.
+// ------------------------------------------------------------ rate limits (دائمة بالقاعدة)
 const _bannedIps = new Set()
 const _bannedDevices = new Set()
 
@@ -78,35 +88,134 @@ function getClientIp(req) {
   return req.headers['x-real-ip'] || req.socket?.remoteAddress || '127.0.0.1'
 }
 
+// بصمة الجهاز: المعرف العميلي الثابت (localStorage) — نفس تنسيق الجيل السابق حتى
+// تبقى الأجهزة المرحّلة من القاعدة معروفة بعد التحديث. البصمة إشارة احتيال،
+// والسر الحقيقي هو كلمة المرور + رمز البريد — فاستنساخها وحده لا يفتح حساباً.
+function deviceFp(req, body) {
+  const raw = String(body.deviceId || body.deviceFingerprint || '').trim()
+  if (raw) return raw.slice(0, 120)
+  return ('ua:' + String(req.headers['user-agent'] || 'unknown')).slice(0, 120)
+}
+
+// ------------------------------------------------------------ أحداث أمنية + تنبيه إدارة
+async function secEvent(profileId, kind, meta, ip) {
+  try {
+    await dal.insert('ur_security_events', {
+      profile_id: profileId || null, kind: kind,
+      meta: meta || {}, ip: ip || '', created_at: new Date().toISOString(),
+    })
+  } catch (_) {}
+}
+async function notifyAdmins(icon, text, orderId) {
+  try {
+    const admins = await dal.all('ur_profiles', { role: 'admin' })
+    for (const a of admins) {
+      await dal.insert('ur_notifications', {
+        user_id: a.id, icon: icon, body: text, order_id: orderId || null,
+        read: false, created_at: new Date().toISOString(),
+      })
+    }
+  } catch (_) {}
+}
+
+// ------------------------------------------------------------ OTP helpers
+function genCode() { return String(crypto.randomInt(100000, 1000000)) }
+
+async function otpDailyCount(email, purpose) {
+  const rows = await dal.all('ur_email_otps', { email: email, purpose: purpose })
+  const dayAgo = Date.now() - 86400000
+  return rows.filter((r) => new Date(r.created_at).getTime() > dayAgo).length
+}
+async function latestOtp(email, purpose) {
+  const rows = await dal.all('ur_email_otps', { email: email, purpose: purpose })
+  return rows.sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime())[0] || null
+}
+
+// ينشئ رمزاً ويرسله؛ يرمي otp_wait / otp_limit / mail_not_configured
+async function issueOtp(email, purpose, ip) {
+  const last = await latestOtp(email, purpose)
+  if (last && !last.consumed_at && (Date.now() - new Date(last.created_at).getTime()) < OTP_RESEND_COOLDOWN_MS) {
+    const e = new Error('otp_wait'); e.code = 'otp_wait'; e.status = 429; throw e
+  }
+  if (await otpDailyCount(email, purpose) >= OTP_DAILY_LIMIT) {
+    const e = new Error('otp_limit'); e.code = 'otp_limit'; e.status = 429; throw e
+  }
+  const code = genCode()
+  await dal.insert('ur_email_otps', {
+    email: email, code_hash: hashPassword(code), purpose: purpose,
+    attempts: 0, expires_at: new Date(Date.now() + OTP_TTL_MS).toISOString(),
+    consumed_at: null, created_at: new Date().toISOString(),
+  })
+  const sent = await sendOtpEmail(email, code, purpose)
+  await secEvent(null, 'otp_issued', { email: email, purpose: purpose }, ip)
+  return sent && sent.dev ? { devCode: code } : {}
+}
+
+// يتحقق من الرمز ويستهلكه؛ يرمي bad_otp / otp_locked / otp_expired
+async function consumeOtp(email, purpose, code) {
+  const row = await latestOtp(email, purpose)
+  if (!row || row.consumed_at) { const e = new Error('bad_otp'); e.code = 'bad_otp'; throw e }
+  if ((row.attempts || 0) >= OTP_MAX_ATTEMPTS) { const e = new Error('otp_locked'); e.code = 'otp_locked'; e.status = 429; throw e }
+  if (new Date(row.expires_at).getTime() < Date.now()) { const e = new Error('otp_expired'); e.code = 'otp_expired'; throw e }
+  const ok = verifyPassword(String(code || '').trim(), row.code_hash)
+  if (!ok) {
+    try { await dal.update('ur_email_otps', { id: row.id }, { attempts: (row.attempts || 0) + 1 }) } catch (_) {}
+    const e = new Error('bad_otp'); e.code = 'bad_otp'; throw e
+  }
+  await dal.update('ur_email_otps', { id: row.id }, { consumed_at: new Date().toISOString() })
+  return true
+}
+
+// ------------------------------------------------------------ جهاز الحساب
+async function activeDevice(profileId, fp) {
+  if (!fp) return null
+  return await dal.find('ur_devices', { profile_id: profileId, fingerprint: fp, status: 'active' })
+}
+async function deviceOwner(fp) {
+  if (!fp) return null
+  return await dal.find('ur_devices', { fingerprint: fp, status: 'active' })
+}
+async function countActiveDevices(profileId) {
+  return (await dal.all('ur_devices', { profile_id: profileId, status: 'active' })).length
+}
+// تفعيل جهاز (مع مزامنة المصفوفة القديمة profiles.devices لكشف التعامل الذاتي)
+async function activateDevice(profile, fp, label, ip) {
+  try {
+    await dal.insert('ur_devices', {
+      profile_id: profile.id, fingerprint: fp, label: String(label || '').slice(0, 80),
+      status: 'active', created_at: new Date().toISOString(), last_seen: new Date().toISOString(),
+    })
+  } catch (e) {
+    if (String((e && e.message) || '').indexOf('duplicate') >= 0) {
+      const owner = await deviceOwner(fp)
+      if (owner && owner.profile_id === profile.id) {
+        try { await dal.update('ur_devices', { id: owner.id }, { last_seen: new Date().toISOString() }) } catch (_) {}
+      } else {
+        const err = new Error('device_in_use'); err.code = 'device_in_use'; err.status = 403; throw err
+      }
+    } else throw e
+  }
+  const devs = Array.from(new Set([].concat(profile.devices || [], [fp]))).slice(-10)
+  try { await dal.update('ur_profiles', { id: profile.id }, { devices: devs, last_ip: ip || profile.last_ip || '' }) } catch (_) {}
+  await secEvent(profile.id, 'device_activated', { fp: fp.slice(0, 24) }, ip)
+}
+
 async function checkDeviceFraud(req, body, phone) {
   const ip = getClientIp(req)
-  const rawDev = String(body.deviceId || body.deviceFingerprint || req.headers['user-agent'] || 'unknown_device').trim()
-  const deviceId = rawDev.slice(0, 120)
-
-  // 1. Check if IP or Device is already banned (القاعدة مصدر الحقيقة)
+  const deviceId = deviceFp(req, body)
   if (await isBanned(ip, deviceId)) {
-    return {
-      blocked: true,
-      error: 'device_blocked',
-      message: '🚫 تم حظر هذا الجهاز / عنوان IP لتجاوز الحد الأقصى المسموح به لإنشاء الحسابات (أكثر من 3 حسابات)'
-    }
+    return { blocked: true, error: 'device_blocked', message: '🚫 تم حظر هذا الجهاز / عنوان IP لتجاوز الحد الأقصى المسموح به لإنشاء الحسابات (أكثر من 3 حسابات)' }
   }
-
-  // 2. تتبع التسجيلات الدائم: 3 أرقام مختلفة كحد أقصى لكل IP/جهاز — والرابع يحظرهما
   const ipPhones = await regPhones('reg:ip:' + ip)
   const devPhones = await regPhones('reg:dev:' + deviceId)
   if ((ipPhones.length >= 3 && ipPhones.indexOf(phone) < 0) || (devPhones.length >= 3 && devPhones.indexOf(phone) < 0)) {
     await banBoth(ip, deviceId)
-    return {
-      blocked: true,
-      error: 'device_blocked',
-      message: '🚫 تم حظر هذا الجهاز / عنوان IP لتجاوز الحد الأقصى المسموح به (أكثر من 3 حسابات)'
-    }
+    return { blocked: true, error: 'device_blocked', message: '🚫 تم حظر هذا الجهاز / عنوان IP لتجاوز الحد الأقصى المسموح به (أكثر من 3 حسابات)' }
   }
-
   return { blocked: false, ip, deviceId }
 }
 
+// ------------------------------------------------------------ handler
 module.exports = async function handler(req, res) {
   cors(res)
   if (req.method === 'OPTIONS') { res.statusCode = 204; return res.end() }
@@ -116,6 +225,8 @@ module.exports = async function handler(req, res) {
     const action = body.action || (req.query && req.query.action)
     if (action === 'register') return await register(res, body, req)
     if (action === 'login') return await login(res, body, req)
+    if (action === 'verifyOtp') return await verifyOtpAction(res, body, req)
+    if (action === 'resendOtp') return await resendOtp(res, body, req)
     if (action === 'me') return await me(req, res)
     return json(res, 400, { ok: false, error: 'unknown_action' })
   } catch (e) {
@@ -127,35 +238,46 @@ async function register(res, b, req) {
   const name = String(b.name || '').trim()
   const phone = normalizePhone(b.phone)
   const pass = String(b.pass || '')
+  const email = String(b.email || '').trim().toLowerCase()
   const area = String(b.area || '').trim()
   const role = b.role === 'provider' ? 'provider' : 'customer'
 
   if (name.length < 2) return json(res, 400, { ok: false, error: 'bad_name' })
   if (!PHONE_RE.test(phone)) return json(res, 400, { ok: false, error: 'bad_phone' })
+  if (!EMAIL_RE.test(email)) return json(res, 400, { ok: false, error: 'bad_email' })
   if (pass.length < 6) return json(res, 400, { ok: false, error: 'bad_pass' })
   if (!area) return json(res, 400, { ok: false, error: 'bad_area' })
 
-  // Anti-Fraud check: Check IP & Device limits (Auto-ban on > 3 accounts) — دائم بالقاعدة
-  const fraudCheck = await checkDeviceFraud(req, b, phone)
-  if (fraudCheck.blocked) {
-    return json(res, 403, { ok: false, error: fraudCheck.error, message: fraudCheck.message })
+  const ip = getClientIp(req)
+  // تحقق البشر (إن فُعّل من الإدارة) قبل أي كتابة
+  if (!(await verifyTurnstile(String(b.turnstileToken || ''), ip))) {
+    return json(res, 403, { ok: false, error: 'turnstile_failed' })
   }
+
+  const fraudCheck = await checkDeviceFraud(req, b, phone)
+  if (fraudCheck.blocked) return json(res, 403, { ok: false, error: fraudCheck.error, message: fraudCheck.message })
 
   const dup = await dal.find('ur_profiles', { phone })
   if (dup) return json(res, 409, { ok: false, error: 'phone_taken' })
+  const dupEmail = await dal.find('ur_profiles', { email: email })
+  if (dupEmail) return json(res, 409, { ok: false, error: 'email_taken' })
+  // الجهاز مربوط بحساب آخر فعّال؟ امنع من أول لحظة — حساب واحد لكل جهاز
+  const devOwner = await deviceOwner(fraudCheck.deviceId)
+  if (devOwner) {
+    await secEvent(null, 'register_on_used_device', { phone: phone }, ip)
+    return json(res, 403, { ok: false, error: 'device_in_use', message: '🚫 هذا الجهاز مرتبط بحساب آخر. جهاز واحد = حساب واحد — إذا كان حسابك، سجّل دخولك.' })
+  }
 
   let primaryServiceRow = null
   let selectedServiceIds = []
 
   if (role === 'provider') {
-    // Collect up to 3 services
     let serviceIds = Array.isArray(b.serviceIds) ? b.serviceIds.slice(0, 3) : []
     if (!serviceIds.length && b.serviceId) serviceIds = [b.serviceId]
     if (!serviceIds.length) serviceIds = ['s1']
 
     for (const sId of serviceIds) {
       if (sId === 'custom' || (sId === serviceIds[0] && b.customServiceName)) {
-        // v7.4 — حدود صارمة للمهنة المخصصة: اسم بطول معقول وسعر ضمن سقف منطقي
         const customName = String(b.customServiceName || 'مهنة خاصة').trim().slice(0, 60) || 'مهنة خاصة'
         const customDesc = String(b.customServiceDesc || 'خدمة مخصصة').trim().slice(0, 200)
         const minPrice = Math.min(500000, Math.max(1000, parseInt(b.customServiceMin, 10) || 10000))
@@ -163,20 +285,9 @@ async function register(res, b, req) {
         const customId = 'svc_' + Date.now().toString(36)
         try {
           const sRow = await dal.insert('ur_services', {
-            id: customId,
-            icon: '⭐',
-            name: customName,
-            cat: 'home',
-            unit: 'خدمة',
-            min_price: minPrice,
-            max_price: maxPrice,
-            wave: 3,
-            description: customDesc,
-            popular: false,
-            sensitive: false,
-            gold: false,
-            active: true,
-            created_at: new Date().toISOString()
+            id: customId, icon: '⭐', name: customName, cat: 'home', unit: 'خدمة',
+            min_price: minPrice, max_price: maxPrice, wave: 3, description: customDesc,
+            popular: false, sensitive: false, gold: false, active: true, created_at: new Date().toISOString()
           })
           selectedServiceIds.push(sRow.id)
           if (!primaryServiceRow) primaryServiceRow = sRow
@@ -197,27 +308,21 @@ async function register(res, b, req) {
   }
 
   const passHash = await hashPassword(pass)
-  // سباق التسجيل المزدوج: القيد الفريد على الهاتف يحسم — نرجّع phone_taken نظيفة بدل 500
   let profile
   try {
     profile = await dal.insert('ur_profiles', {
-      phone,
-      role,
-      name,
-      area,
-      status: 'active',
-      pass_hash: passHash,
-      // نخزّن بصمة الجهاز من أول لحظة — أساس كشف التعامل الذاتي لاحقاً
-      devices: fraudCheck.deviceId ? [fraudCheck.deviceId] : []
+      phone, role, name, area, status: 'active', pass_hash: passHash,
+      email: email, email_verified: false, last_ip: ip,
+      devices: [],
     })
   } catch (e) {
-    if (String((e && e.message) || '').indexOf('duplicate') >= 0) {
-      return json(res, 409, { ok: false, error: 'phone_taken' })
+    const msg = String((e && e.message) || '')
+    if (msg.indexOf('duplicate') >= 0) {
+      return json(res, 409, { ok: false, error: msg.indexOf('email') >= 0 ? 'email_taken' : 'phone_taken' })
     }
     throw e
   }
 
-  // Record successful registration for IP and Device tracking (دائم بالقاعدة)
   await noteRegistration(fraudCheck.ip, fraudCheck.deviceId, phone)
 
   if (role === 'provider') {
@@ -228,31 +333,29 @@ async function register(res, b, req) {
       profile_id: profile.id,
       service_id: primaryServiceRow.id,
       service_ids: selectedServiceIds,
-      exp: exp,
-      areas: areas,
-      // v7.4 — بوابة الثقة: كل مقدم ينتظر توثيق الإدارة بلا استثناء (الواجهة تَعِد بذلك والثقة أساس المنصة)
+      exp: exp, areas: areas,
       verified: 'pending',
       avail: true,
       sensitive: sensitive
     })
-    
-    // Notify admins of new provider
     try {
-      const admins = await dal.all('ur_profiles', { role: 'admin' })
-      for (const a of admins) {
-        await dal.insert('ur_notifications', {
-          user_id: a.id,
-          icon: '👷',
-          body: `مقدم خدمة جديد ينتظر التوثيق: ${name} (${selectedServiceIds.length} مهن: ${primaryServiceRow.name}) — منطقة ${area}`,
-          read: false,
-          created_at: new Date().toISOString()
-        })
-      }
+      await notifyAdmins('👷', 'مقدم خدمة جديد ينتظر التوثيق: ' + name + ' (' + selectedServiceIds.length + ' مهن: ' + primaryServiceRow.name + ') — منطقة ' + area, null)
     } catch (_) {}
   }
 
-  const token = signToken({ sub: profile.id, role: profile.role, phone: profile.phone })
-  return json(res, 200, { ok: true, token, userId: profile.id, role: profile.role })
+  // البريد هو بوابة التفعيل: لا جلسة قبل رمز البريد
+  let extra = {}
+  try {
+    extra = await issueOtp(email, 'register', ip)
+  } catch (e) {
+    if (e.code === 'mail_not_configured' || e.code === 'mail_failed') {
+      await notifyAdmins('📧', 'البريد غير مهيأ — حساب ' + name + ' (' + phone + ') ينتظر رمز التفعيل. اضبط MAIL_* بمتغيرات البيئة', null)
+      extra = { mailPending: true }
+    } else throw e
+  }
+  const pending = signToken({ scope: 'otp', purpose: 'register', sub: profile.id, ph: phone, em: email, fp: fraudCheck.deviceId }, 0.007)
+  await secEvent(profile.id, 'register_pending_otp', {}, ip)
+  return json(res, 200, Object.assign({ ok: true, needsOtp: true, pending: pending, email: email }, extra))
 }
 
 async function login(res, b, req) {
@@ -261,18 +364,15 @@ async function login(res, b, req) {
   if (!PHONE_RE.test(phone) || !pass) return json(res, 400, { ok: false, error: 'bad_credentials' })
 
   const ip = getClientIp(req)
-  const deviceId = String(b.deviceId || b.deviceFingerprint || req.headers['user-agent'] || 'unknown_device').trim().slice(0, 120)
+  const deviceId = deviceFp(req, b)
 
-  // Check if IP or device is banned (القاعدة مصدر الحقيقة)
   if (await isBanned(ip, deviceId)) {
-    return json(res, 403, {
-      ok: false,
-      error: 'device_blocked',
-      message: '🚫 هذا الجهاز محظور من استخدام المنصة'
-    })
+    return json(res, 403, { ok: false, error: 'device_blocked', message: '🚫 هذا الجهاز محظور من استخدام المنصة' })
+  }
+  if (!(await verifyTurnstile(String(b.turnstileToken || ''), ip))) {
+    return json(res, 403, { ok: false, error: 'turnstile_failed' })
   }
 
-  // Anti brute-force: 6 محاولات فاشلة خلال 10 دقائق من نفس الـ IP → إيقاف مؤقت (عداد دائم بالقاعدة)
   const failCount = await loginFailCount(ip)
   if (failCount >= 6) {
     return json(res, 429, { ok: false, error: 'device_blocked', message: '🚫 محاولات دخول كثيرة — انتظر شوية وحاول من جديد' })
@@ -283,15 +383,123 @@ async function login(res, b, req) {
   if (profile.status === 'suspended') return json(res, 403, { ok: false, error: 'suspended' })
 
   const ok = await verifyPassword(pass, profile.pass_hash)
-  if (!ok) { await noteLoginFail(ip); return json(res, 401, { ok: false, error: 'bad_credentials' }) }
+  if (!ok) { await noteLoginFail(ip); await secEvent(profile.id, 'login_bad_password', {}, ip); return json(res, 401, { ok: false, error: 'bad_credentials' }) }
 
-  await clearLoginFails(ip) // دخول ناجح يصفّر العداد
-  // نلحق بصمة الجهاز بكل دخول ناجح (آخر 10 أجهزة) — كشف التعامل الذاتي
-  const devs = Array.from(new Set([].concat(profile.devices || [], [deviceId]))).slice(-10)
-  try { await dal.update('ur_profiles', { id: profile.id }, { devices: devs }) } catch (_) {}
+  await clearLoginFails(ip)
+  try { await dal.update('ur_profiles', { id: profile.id }, { last_ip: ip }) } catch (_) {}
 
-  const token = signToken({ sub: profile.id, role: profile.role, phone: profile.phone })
-  return json(res, 200, { ok: true, token, userId: profile.id, role: profile.role })
+  // جهاز مربوط بحساب آخر؟ ممنوع — حساب واحد لكل جهاز
+  const owner = await deviceOwner(deviceId)
+  if (owner && owner.profile_id !== profile.id) {
+    await secEvent(profile.id, 'login_on_foreign_device', { owner: owner.profile_id }, ip)
+    await notifyAdmins('🚨', 'محاولة دخول لحساب ' + profile.name + ' من جهاز مربوط بحساب آخر — اشتباه مشاركة/اختراق', null)
+    return json(res, 403, { ok: false, error: 'device_in_use', message: '🚫 هذا الجهاز مربوط بحساب آخر — جهاز واحد = حساب واحد.' })
+  }
+  const known = !!(await activeDevice(profile.id, deviceId))
+
+  if (profile.email_verified && profile.email) {
+    const purpose = known ? 'login' : 'device'
+    let extra = {}
+    try {
+      extra = await issueOtp(profile.email, purpose, ip)
+    } catch (e) {
+      if (e.code === 'mail_not_configured' || e.code === 'mail_failed') {
+        await notifyAdmins('📧', 'البريد تعطّل — ' + profile.name + ' ما يكدر يسجّل دخول (OTP). راجع MAIL_*', null)
+        return json(res, 503, { ok: false, error: 'mail_not_configured' })
+      }
+      throw e
+    }
+    const pending = signToken({ scope: 'otp', purpose: purpose, sub: profile.id, ph: phone, fp: deviceId }, 0.007)
+    return json(res, 200, Object.assign({ ok: true, needsOtp: true, pending: pending, email: profile.email, newDevice: !known }, extra))
+  }
+
+  // حسابات قديمة بلا بريد مفعّل (ومنها الإدارة): دخول مباشر مع تنبيه إكمال البريد
+  if (!known) {
+    await activateDevice(profile, deviceId, req.headers['user-agent'], ip)
+    await notifyAdmins('🛡️', 'جهاز جديد فُعّل مباشرة لحساب قديم بلا بريد: ' + profile.name + ' — راجع الأجهزة', null)
+    await secEvent(profile.id, 'legacy_device_autoactivated', { fp: deviceId.slice(0, 24) }, ip)
+  } else {
+    try { await dal.update('ur_devices', { profile_id: profile.id, fingerprint: deviceId, status: 'active' }, { last_seen: new Date().toISOString() }) } catch (_) {}
+  }
+  const token = signToken({ sub: profile.id, role: profile.role, phone: profile.phone, dv: deviceId })
+  return json(res, 200, { ok: true, token: token, userId: profile.id, role: profile.role, needsEmail: !profile.email })
+}
+
+async function verifyOtpAction(res, b, req) {
+  const payload = verifyToken(String(b.pending || ''))
+  if (!payload || payload.scope !== 'otp') return json(res, 401, { ok: false, error: 'bad_pending' })
+  const ip = getClientIp(req)
+  const profile = await dal.find('ur_profiles', { id: payload.sub })
+  if (!profile) return json(res, 404, { ok: false, error: 'user_not_found' })
+  const email = payload.em || profile.email
+  if (!email) return json(res, 400, { ok: false, error: 'bad_pending' })
+
+  await consumeOtp(email, payload.purpose, b.code) // يرمي bad_otp / otp_locked / otp_expired
+
+  if (payload.purpose === 'register' || payload.purpose === 'login') {
+    if (payload.purpose === 'register' && !profile.email_verified) {
+      await dal.update('ur_profiles', { id: profile.id }, { email_verified: true })
+    }
+    if (payload.fp) {
+      const known = await activeDevice(profile.id, payload.fp)
+      if (!known) {
+        const actCount = await countActiveDevices(profile.id)
+        const hasEmailGate = profile.email_verified || payload.purpose === 'register'
+        if (actCount === 0 || !hasEmailGate) {
+          await activateDevice(profile, payload.fp, req.headers['user-agent'], ip)
+        } else {
+          // جهاز جديد لحساب مفعّل: يمر بريداً ثم ينتظر موافقة الإدارة (تبديل العطلان)
+          await dal.insert('ur_devices', {
+            profile_id: profile.id, fingerprint: payload.fp,
+            label: String(req.headers['user-agent'] || '').slice(0, 80),
+            status: 'pending', created_at: new Date().toISOString(), last_seen: new Date().toISOString(),
+            note: 'بانتظار موافقة الإدارة (تبديل جهاز)',
+          })
+          await notifyAdmins('🛡️', 'طلب تبديل جهاز: ' + profile.name + ' (' + profile.phone + ') — راجع تبويب الأمان لاعتماد الجهاز الجديد وإلغاء القديم', null)
+          await secEvent(profile.id, 'device_pending_approval', { fp: payload.fp.slice(0, 24) }, ip)
+          return json(res, 200, { ok: true, needsDeviceApproval: true, message: '🛡️ جهازك الجديد سجّلناه وينتظر موافقة الإدارة — تصلك الموافقة قريباً ومن بعدها تسجّل دخولك بأمان.' })
+        }
+      } else {
+        try { await dal.update('ur_devices', { id: known.id }, { last_seen: new Date().toISOString() }) } catch (_) {}
+      }
+    }
+    await secEvent(profile.id, payload.purpose === 'register' ? 'register_verified' : 'login_verified', {}, ip)
+    const token = signToken({ sub: profile.id, role: profile.role, phone: profile.phone, dv: payload.fp || '' })
+    return json(res, 200, { ok: true, token: token, userId: profile.id, role: profile.role })
+  }
+
+  if (payload.purpose === 'device') {
+    // رمز البريد صحيح — الجهاز ينتظر قرار الإدارة
+    try {
+      await dal.insert('ur_devices', {
+        profile_id: profile.id, fingerprint: payload.fp || deviceFp(req, b),
+        label: String(req.headers['user-agent'] || '').slice(0, 80),
+        status: 'pending', created_at: new Date().toISOString(), last_seen: new Date().toISOString(),
+        note: 'بانتظار موافقة الإدارة (تبديل جهاز)',
+      })
+    } catch (e) {
+      if (String((e && e.message) || '').indexOf('duplicate') < 0) throw e
+    }
+    await notifyAdmins('🛡️', 'طلب تبديل جهاز: ' + profile.name + ' (' + profile.phone + ') — راجع تبويب الأمان', null)
+    await secEvent(profile.id, 'device_pending_approval', {}, ip)
+    return json(res, 200, { ok: true, needsDeviceApproval: true, message: '🛡️ جهازك الجديد ينتظر موافقة الإدارة.' })
+  }
+
+  return json(res, 400, { ok: false, error: 'bad_pending' })
+}
+
+async function resendOtp(res, b, req) {
+  const payload = verifyToken(String(b.pending || ''))
+  if (!payload || payload.scope !== 'otp') return json(res, 401, { ok: false, error: 'bad_pending' })
+  const ip = getClientIp(req)
+  let email = payload.em || ''
+  if (!email && payload.sub) {
+    const profile = await dal.find('ur_profiles', { id: payload.sub })
+    email = profile && profile.email || ''
+  }
+  if (!email) return json(res, 400, { ok: false, error: 'bad_pending' })
+  const extra = await issueOtp(email, payload.purpose, ip) // يرمي otp_wait / otp_limit
+  return json(res, 200, Object.assign({ ok: true, needsOtp: true, pending: b.pending, email: email }, extra))
 }
 
 async function me(req, res) {
@@ -308,9 +516,17 @@ async function me(req, res) {
     provider = await dal.find('ur_providers', { profile_id: profile.id })
   }
 
-  // لا نرسل أبداً pass_hash أو بصمات الأجهزة للعميل — جلسة + هوية تكفي
+  // أجهزتي — المستخدم يشوف أجهزة حسابه (والإدارة تشوف الكل من السنابشوت)
+  let devices = []
+  try {
+    devices = (await dal.all('ur_devices', { profile_id: profile.id }))
+      .map((d) => ({ id: d.id, label: d.label, status: d.status, at: new Date(d.created_at).getTime(), lastSeen: new Date(d.last_seen).getTime() }))
+      .sort((a, b2) => b2.lastSeen - a.lastSeen)
+  } catch (_) {}
+
   const safeUser = Object.assign({}, profile)
   delete safeUser.pass_hash
   delete safeUser.devices
+  safeUser.devicesList = devices
   return json(res, 200, { ok: true, user: safeUser, provider })
 }

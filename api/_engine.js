@@ -9,6 +9,8 @@
 //  · الاعتذار للطلبات النشطة فقط ويمسح إضافات السابق · تعليم تراكمي للإضافات
 //  · تعليم فوق سقف الكتالوج · أي مهنة حساسة (مو بس الأولى) تفرض إعادة توثيق
 //  · التعامل الذاتي يدخل rejected_by (يُخفى ويُرفض) · دفتر الإدارة 200 قيد.
+//  v8.0 — طبقة الهوية: آخر IP بشبكة التواطؤ · أحداث أمنية موثقة · إدارة أجهزة
+//  الحسابات (اعتماد/تبديل/إلغاء) · الذمة ذرية عبر RPC ur_apply_debt بالإنتاج.
 // =====================================================================
 const { dal, hashPassword, verifyPassword, ENV } = require('./_lib')
 
@@ -93,12 +95,21 @@ async function notifyAdmins(icon, text, orderId) {
 async function audit(who, action) {
   await dal.insert('ur_audit_log', { actor: who, action: action, created_at: nowIso() })
 }
+// v8.0 — سجل أمني دائم: كل حدث حساس يوثَّق (لا يوقف العملية إذا تعطل)
+async function secEvent(profileId, kind, meta, ip) {
+  try { await dal.insert('ur_security_events', { profile_id: profileId || null, kind: kind, meta: meta || {}, ip: ip || '', created_at: nowIso() }) } catch (_) {}
+}
 
 // ------------------------------------------------------------ DEBT LEDGER
 //  المنصة لا تمسك فلوس أحد أبداً. العمولة دَين (ذمة) على المقدم يوثَّق
 //  بدفتر ur_ledger مع الرصيد بعد كل قيد — كل دينار لازم يتفسَّر.
 //  signedAmount: موجب يرفع الذمة (عمولة/تعديل)، سالب ينزلها (سداد).
 async function applyDebt(providerId, signedAmount, kind, orderId, note) {
+  // v8.0 — القاعدة الحقيقية تطبق الذمة ذرياً بمعاملة واحدة (ur_apply_debt RPC)؛
+  // المحاكي المحلي (أو غياب الدالة) يمشي بالحلقة التفاؤلية أدناه — نفس النتيجة.
+  if (typeof dal.rpc === 'function') {
+    try { return await dal.rpc('ur_apply_debt', { p_provider: providerId, p_amount: signedAmount, p_kind: kind, p_order: orderId || '', p_note: note || '' }) } catch (_) { /* fallback */ }
+  }
   // قفل تفاؤلي: لو رصيد الذمة تغيّر بين القراءة والكتابة (طلبان يكتملان بنفس اللحظة)
   // نعيد القراءة ونحاول — ما نفقد ولا دينار بالتحديث المتسابق
   for (let attempt = 0; attempt < 4; attempt++) {
@@ -208,6 +219,15 @@ async function snapshot(viewer) {
     dal.find('ur_counters', { kind: 'payout' }),
   ])
   const { cats, services, S } = staticData
+
+  // v8.0 — طبقة الهوية بالسنابشوت: الإدارة تشوف كل الأجهزة والطلبات المعلقة والأحداث
+  // الأمنية؛ والمستخدم العادي يشوف أجهزة حسابه فقط (لصفحة «أجهزتي»)
+  let secDevices = []
+  let secEvents = []
+  if (viewer) {
+    try { secDevices = await dal.all('ur_devices', isAdmin ? {} : { profile_id: viewer.id }) } catch (_) {}
+    if (isAdmin) { try { secEvents = await dal.all('ur_security_events') } catch (_) {} }
+  }
 
   // تنظيف السوق: طلب معلّق أكثر من 48 ساعة ينلغي تلقائياً ويُخطر الزبون (CAS — ما يتكرر)
   const staleBefore = Date.now() - 48 * 3600000
@@ -423,6 +443,12 @@ async function snapshot(viewer) {
     payouts: payoutsOut,
     audit: auditOut,
     ledger: ledgerOut,
+    security: viewer ? {
+      myDevices: secDevices.filter((d) => d.profile_id === viewer.id).map((d) => ({ id: d.id, label: d.label, status: d.status, note: d.note || '', at: toMs(d.created_at), lastSeen: toMs(d.last_seen) })),
+      devices: isAdmin ? secDevices.map((d) => { const pr = profiles.find((x) => x.id === d.profile_id) || {}; return { id: d.id, profileId: d.profile_id, name: pr.name || '', fp: String(d.fingerprint).slice(0, 24), label: d.label, status: d.status, note: d.note || '', at: toMs(d.created_at), lastSeen: toMs(d.last_seen) } }) : [],
+      deviceRequests: isAdmin ? secDevices.filter((d) => d.status === 'pending').map((d) => { const pr = profiles.find((x) => x.id === d.profile_id) || {}; return { id: d.id, profileId: d.profile_id, name: pr.name || '', phone: pr.phone || '', fp: String(d.fingerprint).slice(0, 24), label: d.label, at: toMs(d.created_at) } }) : [],
+      events: isAdmin ? secEvents.slice().sort((a, b) => toMs(b.created_at) - toMs(a.created_at)).slice(0, 100).map((x) => ({ id: 'se' + x.id, profileId: x.profile_id, kind: x.kind, meta: x.meta || {}, ip: x.ip, at: toMs(x.created_at) })) : [],
+    } : null,
     stats: { verifiedProvs: verifiedProvs, doneOrders: doneAll.length, avgR: avgR, reviews: statReviews },
   }
   return db
@@ -458,6 +484,7 @@ async function runAction(actor, action, p) {
       // كشف التعامل الذاتي: تطابق بصمة جهاز الزبون مع جهاز أي مقدم مطابق
       // → الطلب يُعلَّم للإدارة ويُخفى ع�� ذلك المق��م تحديداً
       const myDevices = actor.devices || []
+      const myIp = actor.last_ip || ''
       let flagged = false
       const matched = await providersMatching(p.serviceId, p.area, actor.id)
       const targets = []
@@ -465,9 +492,14 @@ async function runAction(actor, action, p) {
       const sharedIds = []
       for (const t of matched) {
         const tp = await getProfile(t.profile_id)
-        const shared = tp && (tp.devices || []).some((d) => myDevices.indexOf(d) >= 0)
-        if (shared) { flagged = true; sharedIds.push(t.profile_id) }
-        else targets.push(t)
+        const sharedDev = tp && (tp.devices || []).some((d) => myDevices.indexOf(d) >= 0)
+        // v8.0 — ينضاف للاستبعاد كل مقدم يشارك الزبون آخر IP معروف (تلفونين على نفس
+        // الشبكة / بيت واحد): يُستبعد من الطلب ويُوثَّق — والعائلة ببيت واحد تُراجع يدوياً
+        const sharedIp = !!(tp && myIp && tp.last_ip && tp.last_ip === myIp)
+        if (sharedDev || sharedIp) {
+          flagged = true; sharedIds.push(t.profile_id)
+          await secEvent(actor.id, 'collusion_flag', { provider: t.profile_id, via: sharedDev ? 'device' : 'ip', service: p.serviceId }, myIp)
+        } else targets.push(t)
       }
       await dal.insert('ur_orders', {
         id: id, service_id: p.serviceId, customer_id: actor.id, provider_id: null,
@@ -478,7 +510,7 @@ async function runAction(actor, action, p) {
         timeline: [{ s: 'pending', at: Date.now() }], rejected_by: sharedIds, disputed: false,
         flagged: flagged, created_at: nowIso(),
       })
-      if (flagged) await notifyAdmins('🚨', 'طلب ' + id + ' مُعلَّم: تطابق بصمة جهاز الزبون مع جهاز مقدم خدمة مطابق (اشتباه تعامل ذاتي)', id)
+      if (flagged) await notifyAdmins('🚨', 'طلب ' + id + ' مُعلَّم: تطابق جهاز/عنوان IP بين الزبون ومقدم مطابق (اشتباه تعامل ذاتي)', id)
       // ماكو مقدم متاح؟ الإدارة لازم تدري فوراً — الطلب ما يظل صامت
       if (!targets.length) await notifyAdmins('⚠️', 'طلب ' + id + ' (' + (s ? s.name : '') + ' — ' + p.area + ') بدون مقدم موثّق متاح — وفّر مقدم أو كلّف أحد', id)
       for (const t of targets) await notify(t.profile_id, '\ud83d\udce5', '\u0637\u0644\u0628 \u062c\u062f\u064a\u062f ' + id + ' \u0628\u0645\u0646\u0637\u0642\u062a\u0643 \u2014 ' + (s ? s.name : ''), id)
@@ -949,6 +981,56 @@ async function runAction(actor, action, p) {
       await dal.update('ur_tickets', { id: t.id }, { status: 'closed' })
       await notify(t.user_id, '\u2705', '\u0623\u064f\u063a\u0644\u0642\u062a \u062a\u0630\u0643\u0631\u062a\u0643 ' + t.id, t.order_id)
       await audit(actor.name, '\u0625\u063a\u0644\u0627\u0642 \u0627\u0644\u062a\u0630\u0643\u0631\u0629 ' + t.id)
+      return {}
+    }
+    // ---------------- v8.0: إدارة الأجهزة (الإدارة فقط) ----------------
+    case 'approveDevice': {
+      forbid(isAdmin)
+      const d = await dal.find('ur_devices', { id: p.deviceId }); need(d, 'device_not_found')
+      need(d.status === 'pending', 'order_unavailable')
+      const prof = await getProfile(d.profile_id)
+      const mode = p.mode === 'add' ? 'add' : 'replace'
+      if (mode === 'replace') {
+        // تبديل الهاتف العطلان: كل أجهزته القديمة تُلغى والجديد يصير الوحيد
+        const others = await dal.all('ur_devices', { profile_id: d.profile_id, status: 'active' })
+        for (const od of others) {
+          await dal.update('ur_devices', { id: od.id }, { status: 'revoked', note: 'أُلغي بتبديل جهاز معتمد — ' + nowIso() })
+        }
+      }
+      await dal.update('ur_devices', { id: d.id }, { status: 'active', note: String(p.note || 'اعتمدته الإدارة').slice(0, 120) })
+      if (prof) {
+        const fresh = await dal.all('ur_devices', { profile_id: d.profile_id, status: 'active' })
+        await dal.update('ur_profiles', { id: d.profile_id }, { devices: fresh.map((x) => x.fingerprint).slice(-10) })
+        await notify(d.profile_id, '✅', mode === 'replace' ? 'اعتمدت الإدارة جهازك الجديد وألغت القديم — تكدر تسجّل دخولك هسّه' : 'اعتمدت الإدارة جهازك الجديد — تكدر تستخدمه هسّه', null)
+      }
+      await secEvent(d.profile_id, mode === 'replace' ? 'device_replaced' : 'device_added', { by: actor.name }, '')
+      await audit(actor.name, (mode === 'replace' ? 'تبديل جهاز' : 'اعتماد جهاز') + ' لـ ' + (prof ? prof.name : d.profile_id))
+      return {}
+    }
+    case 'rejectDevice': {
+      forbid(isAdmin)
+      const d = await dal.find('ur_devices', { id: p.deviceId }); need(d, 'device_not_found')
+      need(d.status === 'pending', 'order_unavailable')
+      await dal.update('ur_devices', { id: d.id }, { status: 'revoked', note: String(p.reason || 'رفضته الإدارة').slice(0, 120) })
+      const prof = await getProfile(d.profile_id)
+      if (prof) await notify(d.profile_id, '🚫', 'الإدارة رفضت الجهاز الجديد — إذا كان جهازك فعلاً، راسل الدعم', null)
+      await secEvent(d.profile_id, 'device_rejected', { by: actor.name }, '')
+      await audit(actor.name, 'رفض جهاز لـ ' + (prof ? prof.name : d.profile_id))
+      return {}
+    }
+    case 'revokeDevice': {
+      forbid(isAdmin)
+      const d = await dal.find('ur_devices', { id: p.deviceId }); need(d, 'device_not_found')
+      need(d.status === 'active', 'order_unavailable')
+      await dal.update('ur_devices', { id: d.id }, { status: 'revoked', note: String(p.reason || 'ألغته الإدارة').slice(0, 120) })
+      const prof = await getProfile(d.profile_id)
+      if (prof) {
+        const fresh = await dal.all('ur_devices', { profile_id: d.profile_id, status: 'active' })
+        await dal.update('ur_profiles', { id: d.profile_id }, { devices: fresh.map((x) => x.fingerprint).slice(-10) })
+        await notify(d.profile_id, '📵', 'أُلغي أحد أجهزتك من الإدارة — جلسته انتهت فوراً', null)
+      }
+      await secEvent(d.profile_id, 'device_revoked', { by: actor.name, reason: String(p.reason || '').slice(0, 80) }, '')
+      await audit(actor.name, 'إلغاء جهاز لـ ' + (prof ? prof.name : d.profile_id))
       return {}
     }
     // ---------------- lifecycle: reject / cancel ----------------

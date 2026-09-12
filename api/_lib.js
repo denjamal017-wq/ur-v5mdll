@@ -11,6 +11,13 @@ const ENV = {
   ADMIN_PHONE: process.env.ADMIN_PHONE || '07800000000',
   ADMIN_PASSWORD: process.env.ADMIN_PASSWORD || 'ur-admin-2026',
   ADMIN_NAME: process.env.ADMIN_NAME || '\u0625\u062f\u0627\u0631\u0629 \u0623\u0648\u0631',
+  // v8.0 — البريد (OTP) والتحقق من البشر (Cloudflare Turnstile)
+  MAIL_PROVIDER: process.env.MAIL_PROVIDER || '',
+  MAIL_API_KEY: process.env.MAIL_API_KEY || '',
+  MAIL_FROM: process.env.MAIL_FROM || '',
+  MAIL_DEV_ECHO: process.env.MAIL_DEV_ECHO === '1',
+  TURNSTILE_SECRET: process.env.TURNSTILE_SECRET || '',
+  TURNSTILE_SITE_KEY: process.env.TURNSTILE_SITE_KEY || '',
 }
 
 const cloudReady = !!(ENV.SUPABASE_URL && ENV.SERVICE_KEY && ENV.JWT_SECRET)
@@ -73,6 +80,12 @@ const dal = {
     })
     if (error) throw new Error('nextSeq: ' + error.message)
     return typeof data === 'number' ? data : (data && data[0]) || start
+  },
+  // v8.0 — RPC عام (الذمة الذرية ur_apply_debt وغيرها)
+  async rpc(fn, args) {
+    const { data, error } = await getClient().rpc(fn, args || {})
+    if (error) throw new Error('rpc.' + fn + ': ' + error.message)
+    return data
   },
 }
 
@@ -155,10 +168,27 @@ function verifyPassword(pw, stored) {
   } catch (e) { return false }
 }
 
+// ---- Cloudflare Turnstile — يشتغل فقط عند ضبط TURNSTILE_SECRET -----------
+//  التوكن أحادي الاستخدام وصالح 300 ثانية؛ التحقق السيرفري إلزامي (وثائق كلاودفلير).
+async function verifyTurnstile(token, ip) {
+  if (!ENV.TURNSTILE_SECRET) return true // غير مفعّل — تخطَّ بهدوء (وضع التطوير)
+  if (!token || typeof token !== 'string' || token.length > 2048) return false
+  try {
+    const r = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: 'secret=' + encodeURIComponent(ENV.TURNSTILE_SECRET) + '&response=' + encodeURIComponent(token) + (ip ? '&remoteip=' + encodeURIComponent(ip) : ''),
+    })
+    const j = await r.json().catch(() => null)
+    return !!(j && j.success === true)
+  } catch (e) { return false }
+}
+
 module.exports = {
   ENV, cloudReady, dal, getClient, __setClientForTest,
   cors, json, readBody,
   signToken, verifyToken, getToken,
   hashPassword, verifyPassword,
+  verifyTurnstile,
   crypto,
 }

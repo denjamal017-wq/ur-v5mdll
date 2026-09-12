@@ -16,6 +16,13 @@ module.exports = async function handler(req, res) {
     let viewer = null
     if (payload) viewer = await dal.find('ur_profiles', { id: payload.sub })
 
+    // v8.0 — الجلسة مربوطة بجهاز فعّال: إلغاء الجهاز من لوحة الإدارة يقتل الجلسة فوراً
+    if (viewer && payload && payload.dv) {
+      const dvRow = await dal.find('ur_devices', { profile_id: viewer.id, fingerprint: payload.dv, status: 'active' })
+      if (!dvRow) return json(res, 401, { ok: false, error: 'device_revoked' })
+      try { await dal.update('ur_devices', { id: dvRow.id }, { last_seen: new Date().toISOString() }) } catch (_) {}
+    }
+
     if (action === 'snapshot') {
       const db = await snapshot(viewer)
       return json(res, 200, { ok: true, db })

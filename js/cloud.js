@@ -1,7 +1,10 @@
 /* ================= UR v6 — طبقة السحابة (Vercel + Supabase) =================
    كل إجراء يروح للسيرفر ويتخزن بقاعدة البيانات — ماكو شي وهمي أبداً.
    v8 — تصحيح المنطق: مصفوفة صلاحيات صفحة الطلب (المقدم ما يلغي أبداً) +
-        رؤية الطلبات المعلقة للمقدم + واجهة الذمة المالية + إصلاح نص مكسور. */
+        رؤية الطلبات المعلقة للمقدم + واجهة الذمة المالية + إصلاح نص مكسور.
+   v8.6 — طبقة الهوية: بريد + رمز OTP بخطوتين (تسجيل/دخول/جهاز جديد) + ربط الجهاز
+        (جهاز واحد = حساب واحد) + تبويب «الأمان» للإدارة + «أجهزتي» للمستخدم
+        + Turnstile عند تفعيله + إصلاح إيموجي «منطقة الخطر» المتضرر بالمحرر. */
 (function(){
 'use strict';
 
@@ -87,7 +90,20 @@ var ERR={
   cannot_delete_admin:'\ud83d\udeab لا يمكن حذف حساب الإدارة',
   disputed_open:'\u2696\ufe0f الطلب عليه نزاع مفتوح — ما يكتمِل حتى تُحسم الإدارة',
   cancel_abuse:'\ud83d\udeab إلغاءات متكررة خلال 24 ساعة — الطلبات متوقفة مؤقتاً حمايةً لوقت المقدمين',
-  extra_pending:'\u26a0\ufe0f أكو إضافات بانتظار موافقة الزبون — تُحسم أو تُسحب قبل الإكمال'
+  extra_pending:'\u26a0\ufe0f أكو إضافات بانتظار موافقة الزبون — تُحسم أو تُسحب قبل الإكمال',
+  bad_email:'📧 أدخل بريداً إلكترونياً صحيحاً (مثل name@gmail.com)',
+  email_taken:'⚠️ هذا البريد مسجّل بحساب آخر — سجّل دخولك',
+  bad_otp:'📧 رمز التحقق غير صحيح — تأكد وحاول ثانية',
+  otp_locked:'🚫 محاولات كثيرة برمز غلط — اطلب رمزاً جديداً',
+  otp_expired:'⏰ انتهت صلاحية الرمز — اطلب رمزاً جديداً',
+  otp_wait:'⏰ انتظر دقيقة قبل طلب رمز جديد',
+  otp_limit:'⏰ وصلت الحد اليومي لرموز التحقق — حاول غداً',
+  turnstile_failed:'🤖 تحقق «أنا مو روبوت» ما تم — حاول ثانية',
+  bad_pending:'⏰ الجلسة انتهت — عيد المحاولة من البداية',
+  mail_not_configured:'⚠️ خدمة البريد متوقفة مؤقتاً — راسل الإدارة',
+  device_in_use:'🚫 هذا الجهاز مرتبط بحساب آخر — جهاز واحد = حساب واحد',
+  device_revoked:'📵 هذا الجهاز انسحب اعتماده — سجّل دخولك من جهاز معتمد',
+  device_not_found:'⚠️ الجهاز غير موجود'
 };
 function errMsg(code){ return ERR[code] || ('\u26a0\ufe0f صار خطأ' + (code?(' ('+code+')'):'')); }
 
@@ -379,6 +395,7 @@ function installCloud(){
     var pass = $('rgPass') ? $('rgPass').value : '';
     var pass2 = $('rgPass2') ? $('rgPass2').value : '';
     var area = $('rgArea') ? $('rgArea').value.trim() : '';
+    var email = ($('rgEmail') ? $('rgEmail').value : '').trim();
     var role = window._regRole || 'customer';
     
     if(name.length < 2){ toast('✍️ يرجى كتابة اسمك الكامل'); return; }
@@ -386,6 +403,7 @@ function installCloud(){
     if(pass.length < 6){ toast('🔑 كلمة المرور يجب أن تكون 6 أحرف على الأقل'); return; }
     if(pass !== pass2){ toast('⚠️ كلمتا المرور غير متطابقتين'); return; }
     if(!area){ toast('📍 يرجى كتابة اسم منطقتك بالناصرية'); return; }
+    if(!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email)){ toast('📧 أدخل بريدك الإلكتروني الصحيح — رمز التحقق يوصلك عليه'); return; }
     
     var payload = {
       action: 'register',
@@ -394,7 +412,9 @@ function installCloud(){
       phone: phone,
       pass: pass,
       area: area,
-      deviceId: getDeviceFingerprint()
+      deviceId: getDeviceFingerprint(),
+      email: email,
+      turnstileToken: getTurnstileToken()
     };
     
     if(role === 'provider'){
@@ -430,8 +450,9 @@ function installCloud(){
     
     window._lastPhone = phone;
     
-    // Direct Instant Registration (Zero OTP)
+    // v8.6 — التسجيل صار بخطوتين: السيرفر يرجّع needsOtp فنفتح خطوة الرمز
     apiCall('auth', payload).then(function(j){
+      if(j && j.needsOtp){ openOtpStep(j.pending, j.email || email, 'register'); return; }
       setToken(j.token);
       return refresh().then(function(){
         var u = me();
@@ -462,7 +483,10 @@ function installCloud(){
     if(!pass){ toast('🔑 يرجى كتابة كلمة المرور'); return; }
     
     window._lastPhone = phone;
-    apiCall('auth', { action:'login', phone:phone, pass:pass, deviceId: getDeviceFingerprint() }).then(function(j){
+    apiCall('auth', { action:'login', phone:phone, pass:pass, deviceId: getDeviceFingerprint(), turnstileToken: getTurnstileToken() }).then(function(j){
+      if(j && j.needsOtp){ openOtpStep(j.pending, j.email || '', j.newDevice ? 'device' : 'login'); return; }
+      if(j && j.needsDeviceApproval){ toast('🛡️ ' + (j.message || 'جهازك سجّل وينتظر موافقة الإدارة')); return; }
+      if(j && j.needsEmail){ setTimeout(function(){ toast('📧 حسابك قديم بلا بريد — الإدارة تضيفه لك من لوحة الأمان'); }, 2200); }
       setToken(j.token);
       return refresh().then(function(){
         var u = me();
@@ -482,6 +506,9 @@ function installCloud(){
         toast('⚠️ كلمة المرور غير صحيحة');
       } else if(c === 'suspended'){
         toast('🚫 حسابك موقوف — راجع الإدارة عبر الدعم');
+      } else if(c === 'device_revoked'){
+        setToken(null);
+        toast('📵 هذا الجهاز انسحب اعتماده من الإدارة');
       } else {
         toast(errMsg(c));
       }
@@ -491,6 +518,119 @@ function installCloud(){
   window.logout = function(){
     setToken(null);
     refresh().then(function(){ toast('\ud83d\udc4b تم تسجيل الخروج'); go('#/home'); }, function(){ toast('\ud83d\udc4b تم تسجيل الخروج'); go('#/home'); });
+  };
+
+  /* ============ v8.6 — رمز البريد (OTP) + Turnstile + بريد التسجيل ============ */
+  var _otpState = { pending:null, email:'', purpose:'login', resendAt:0 };
+  window.openOtpStep = function(pending, email, purpose){
+    _otpState = { pending:pending, email:email, purpose:purpose||'login', resendAt: Date.now()+60000 };
+    openModal('📧 رمز التحقق من بريدك',
+      '<div style="text-align:center;margin-bottom:10px"><span style="font-size:38px">📧</span></div>'
+      +'<p style="font-size:14px;color:var(--muted);text-align:center;line-height:1.9">أرسلنا رمزاً من 6 أرقام إلى<br><b style="direction:ltr;display:inline-block">'+esc(email)+'</b><br>اكتبه هنا حتى نكمل '+(purpose==='register'?'تفعيل حسابك':purpose==='device'?'تأكيد جهازك الجديد':'دخولك')+' — صالح 10 دقائق ويُستخدم مرة وحدة.</p>'
+      +'<div class="field"><input id="otpCode" inputmode="numeric" maxlength="6" placeholder="••••••" style="text-align:center;font-size:26px;font-weight:900;letter-spacing:12px;direction:ltr"></div>'
+      +'<div style="display:flex;justify-content:space-between;align-items:center;margin-top:4px"><button class="btn btn-ghost btn-sm" onclick="resendOtpCode()">↺ إعادة الإرسال</button><span style="font-size:12px;color:var(--faint)">ما وصلك؟ راجع السبام</span></div>',
+      '✓ تأكيد', function(){ verifyOtpCode(); });
+    setTimeout(function(){ var i=$('otpCode'); if(i) i.focus(); }, 180);
+  };
+  window.verifyOtpCode = function(){
+    var code = ($('otpCode') ? $('otpCode').value : '').trim();
+    if(!/^\d{6}$/.test(code)){ toast('📧 اكتب الرمز الستّي'); return; }
+    apiCall('auth', { action:'verifyOtp', pending:_otpState.pending, code:code }).then(function(j){
+      if(j && j.needsDeviceApproval){ closeModal(); toast('🛡️ '+(j.message||'جهازك ينتظر موافقة الإدارة')); return; }
+      if(j && j.token){
+        setToken(j.token); closeModal();
+        return refresh().then(function(){
+          var u=me(); toast('🎉 تم التحقق — أهلاً '+(u&&u.name?u.name.split(' ')[0]:''));
+          var next=window._authNext; window._authNext=null;
+          var target=(next && (next.indexOf('#/book')===0 || next.indexOf('#/order/')===0)) ? next : (j.role==='admin'?'#/admin':'#/home');
+          go(target);
+        });
+      }
+    }).catch(function(e){
+      var c=e&&e.code;
+      toast(errMsg(c));
+      var i=$('otpCode'); if(i && (c==='bad_otp'||c==='otp_expired')){ i.value=''; i.focus(); }
+    });
+  };
+  window.resendOtpCode = function(){
+    if(Date.now() < _otpState.resendAt){ toast('⏰ انتظر دقيقة قبل طلب رمز جديد'); return; }
+    apiCall('auth', { action:'resendOtp', pending:_otpState.pending }).then(function(j){
+      _otpState.resendAt = Date.now()+60000;
+      if(j && j.pending) _otpState.pending = j.pending;
+      toast('📧 انرسل رمز جديد لبريدك');
+    }).catch(function(e){ toast(errMsg(e&&e.code)); });
+  };
+
+  // Turnstile: يشتغل فقط إذا المفتاح العلني رجع من /api/health (الإدارة فعّلته)
+  window._turnstileSiteKey = null;
+  function getTurnstileToken(){
+    try{ if(window.turnstile && window._turnstileSiteKey){ return window.turnstile.getResponse() || ''; } }catch(e){}
+    return '';
+  }
+  function renderTurnstileWidgets(){
+    if(!window.turnstile || !window._turnstileSiteKey) return;
+    ['lgTurnstile','rgTurnstile'].forEach(function(id){
+      var el=document.getElementById(id);
+      if(el && !el.dataset.rendered){ el.dataset.rendered='1'; try{ window.turnstile.render(el,{sitekey:window._turnstileSiteKey}); }catch(e){} }
+    });
+  }
+  function installTurnstile(){
+    if(!window._turnstileSiteKey || window._turnstileReady) return;
+    window._turnstileReady = true;
+    var s=document.createElement('script');
+    s.src='https://challenges.cloudflare.com/turnstile/v0/api.js';
+    s.onload=function(){ renderTurnstileWidgets(); };
+    document.head.appendChild(s);
+  }
+
+  // بعد كل render: نزرع حقل البريد بفورم التسجيل + حاويات Turnstile (مرة وحدة لكل فورم)
+  var _origRender = (typeof render==='function') ? render : null;
+  window.render = function(){
+    if(_origRender) _origRender.apply(this, arguments);
+    setTimeout(function(){
+      try{
+        var rp=$('rgPhone');
+        if(rp && !$('rgEmail') && rp.closest('.field')) rp.closest('.field').insertAdjacentHTML('afterend','<div class="field"><label>📧 البريد الإلكتروني (رمز التحقق يوصلك عليه)</label><input id="rgEmail" type="email" dir="ltr" placeholder="name@gmail.com" autocomplete="email"></div>');
+        var lg=$('lgPass');
+        if(window._turnstileSiteKey){
+          if(lg && !$('lgTurnstile') && lg.closest('.field')) lg.closest('.field').insertAdjacentHTML('afterend','<div class="field" id="lgTurnstile"></div>');
+          var rg=$('rgArea');
+          if(rg && !$('rgTurnstile') && rg.closest('.field')) rg.closest('.field').insertAdjacentHTML('afterend','<div class="field" id="rgTurnstile"></div>');
+          renderTurnstileWidgets();
+        }
+      }catch(e){}
+    }, 60);
+  };
+  fetch(API_BASE+'/health').then(function(r){ return r.json(); }).then(function(j){
+    if(j && j.turnstileSiteKey){ window._turnstileSiteKey=j.turnstileSiteKey; installTurnstile(); }
+  }).catch(function(){});
+
+  // إجراءات أجهزة الإدارة (تبويب الأمان)
+  window.approveDeviceAsk = wrap('approveDevice', function(id, mode){ return {deviceId:id, mode:mode||'replace'}; },
+    function(r){ toast('✅ اعتمدت الجهاز'); renderSecurityAdmin(); renderHeader(currentRoute().name); });
+  window.rejectDeviceAsk = wrap('rejectDevice', function(id){ return {deviceId:id}; },
+    function(r){ toast('🚫 انرفض الجهاز'); renderSecurityAdmin(); renderHeader(currentRoute().name); });
+  window.revokeDeviceAsk = wrap('revokeDevice', function(id){ return {deviceId:id, reason:'من لوحة الأمان'}; },
+    function(r){ toast('📵 انلغى الجهاز — جلسته ماتت فوراً'); renderSecurityAdmin(); renderHeader(currentRoute().name); });
+
+  // بطاقة «أجهزتي» بصفحة الحساب
+  var _origRenderAccount = window.renderAccount;
+  window.renderAccount = function(tab){
+    if(typeof _origRenderAccount==='function') _origRenderAccount(tab);
+    if(tab && tab!=='profile') return;
+    setTimeout(function(){
+      try{
+        var root=$('accountRoot'); if(!root || root.querySelector('#myDevicesCard')) return;
+        var sec=(DB&&DB.security)||null;
+        var list=(sec&&sec.myDevices)||[];
+        var html='<div class="card" id="myDevicesCard" style="margin-top:16px"><h4 style="font-size:16px;font-weight:900;margin-bottom:12px">📱 أجهزة حسابك</h4>'
+          +(list.length? list.map(function(d){
+              return '<div class="detail-row"><span>'+esc(d.label||'جهاز')+'<br><span style="font-size:11.5px;color:var(--faint)">آخر استخدام '+fmtD(d.lastSeen||d.at)+'</span></span><b>'+(d.status==='pending'?'<span class="chip chip-amber">⏳ قيد الاعتماد</span>':d.status==='active'?'<span class="chip chip-green">✓ معتمد</span>':'<span class="chip chip-gray">ملغى</span>')+'</b></div>';
+            }).join('') : '<div style="color:var(--faint);font-size:13px;padding:6px 0">جهازك الحالي انسجّل تلقائياً عند الدخول.</div>')
+          +'<div class="hint" style="font-size:12px;color:var(--faint);margin-top:10px">جهاز واحد = حساب واحد. تلفونك العطلان؟ سجّل دخولك من الجديد برمز بريدك، والإدارة تعتمد الجديد وتلغي القديم.</div></div>';
+        root.insertAdjacentHTML('beforeend', html);
+      }catch(e){}
+    }, 80);
   };
 
   window.resetDB=function(){ toast('\u26a0\ufe0f غير متاح في وضع السحابة — استخدم لوحة Supabase'); };
@@ -853,7 +993,7 @@ function installCloud(){
       +'<div class="field"><label>كلمة المرور الحالية</label><input id="pwOld" type="password" placeholder="••••••••"></div>'
       +'<div class="field"><label>الجديدة (6+ أحرف)</label><input id="pwNew" type="password" placeholder="••••••••"></div>'
       +'</div><button class="btn btn-outline btn-sm" onclick="changePass()">تغيير كلمة المرور</button></div>'
-      +'<div class="card" style="margin-top:16px;border:1.5px solid rgba(220,38,38,.3);background:rgba(220,38,38,.02)"><h4 style="font-size:16px;font-weight:900;color:var(--danger);margin-bottom:8px">�� منطقة الخطر — إدارة الحساب</h4><p style="font-size:13.5px;color:var(--muted);margin-bottom:14px">عند حذف الحساب، سيتم إزالة ملفك وسجلاتك نهائياً من المنصة.</p><button class="btn btn-danger btn-sm" onclick="askDeleteAccount()">🗑️ طلب حذف الحساب نهائياً</button></div>';
+      +'<div class="card" style="margin-top:16px;border:1.5px solid rgba(220,38,38,.3);background:rgba(220,38,38,.02)"><h4 style="font-size:16px;font-weight:900;color:var(--danger);margin-bottom:8px">🚨 منطقة الخطر — إدارة الحساب</h4><p style="font-size:13.5px;color:var(--muted);margin-bottom:14px">عند حذف الحساب، سيتم إزالة ملفك وسجلاتك نهائياً من المنصة.</p><button class="btn btn-danger btn-sm" onclick="askDeleteAccount()">🗑️ طلب حذف الحساب نهائياً</button></div>';
   }
 
   const svcsTitle = allMySvcs.length > 1
@@ -903,14 +1043,70 @@ function installCloud(){
   </div>`;
   };
 
-  /* ============ v8.5 — لوحة الأدمن: جدول «آخر العمولات المحصلة» بكل معلومات الطلب من القيم الموثّقة ============ */
+  /* ============ v8.5/v8.6 — لوحة الأدمن: جدول العمولات الموثّق + تبويب الأمان ============ */
   var _origRenderAdmin = window.renderAdmin;
   window.renderAdmin = function(tab){
+    if(tab==='security'){ renderSecurityAdmin(); return; }
     if(typeof _origRenderAdmin==='function') _origRenderAdmin(tab);
     if(tab==='finance') upgradeFinanceCommissions();
+    ensureSecurityTab();
   };
 
   installModePill();
+}
+
+// v8.6 — زر تبويب «الأمان» ينزرع بشريط تبويبات الإدارة بعد كل عرض
+function ensureSecurityTab(){
+  var root=$('adminRoot'); if(!root) return;
+  if(root.querySelector('#admSecTabBtn')) return;
+  var btns=root.querySelectorAll('button[onclick*="#/admin/"]');
+  if(!btns.length) return;
+  var last=btns[btns.length-1];
+  var b=document.createElement('button');
+  b.id='admSecTabBtn'; b.className=last.className; b.innerHTML='🛡️ الأمان';
+  b.setAttribute('onclick',"go('#/admin/security')");
+  last.parentNode.insertBefore(b, last.nextSibling);
+}
+
+// v8.6 — تبويب الأمان: طلبات الأجهزة المعلقة + كل الأجهزة + سجل الأحداث الأمنية
+function renderSecurityAdmin(){
+  var u=me(); if(!u || u.role!=='admin'){ go('#/home'); return; }
+  var sec=(DB&&DB.security)||{};
+  var reqs=sec.deviceRequests||[], devs=sec.devices||[], evs=sec.events||[];
+  var evIcon={login:'🔑',login_new_device:'📱',register:'🆕',otp_verified:'✅',otp_failed:'⚠️',otp_issued:'📧',device_replaced:'🔄',device_added:'➕',device_revoked:'📵',device_rejected:'🚫',collusion_flag:'🚨',turnstile_fail:'🤖',register_device_in_use:'⛔'};
+  var tabs=[['orders','📦 الطلبات'],['verify','🛡️ التوثيق'],['users','👥 المستخدمون'],['finance','💰 الماليات'],['catalog','🧰 الكتالوج'],['tickets','🎧 التذاكر'],['settings','⚙️ الإعدادات']];
+  var html='<div class="page-head"><h1>🛡️ <span class="hl">الأمان</span> والأجهزة</h1><p>اعتماد الأجهزة الجديدة، إلغاء أجهزة (تلفون عطلان/منهوب)، ومراقبة الأحداث الأمنية — كل حركة موثّقة.</p></div>';
+  html+='<div class="ptabs" style="margin-bottom:18px">'+tabs.map(function(t){return '<button class="ptab" onclick="go(\'#/admin/'+t[0]+'\')">'+t[1]+'</button>';}).join('')+'<button class="ptab active">🛡️ الأمان</button></div>';
+
+  html+='<h3 style="font-size:17px;font-weight:900;margin-bottom:12px">⏳ طلبات أجهزة جديدة تنتظر الاعتماد ('+reqs.length+')</h3>';
+  html+= reqs.length? reqs.map(function(d){
+    return '<div class="req-card" style="border:1.5px solid rgba(245,158,11,.4)"><div class="top"><div class="ic">📱</div>'
+      +'<div><b>'+esc(d.name||'مستخدم')+' <span class="chip chip-amber" style="font-size:11px;padding:2px 9px">ينتظر الاعتماد</span></b>'
+      +'<span>'+esc(d.phone||'')+' · '+esc(d.label||'جهاز')+' · بصمة <span style="direction:ltr;display:inline-block">'+esc(d.fp)+'…</span> · '+timeAgo(d.at)+'</span></div></div>'
+      +'<div class="actions" style="gap:8px;flex-wrap:wrap">'
+      +'<button class="btn btn-primary btn-sm" onclick="approveDeviceAsk(\''+d.id+'\',\'replace\')">🔄 اعتماد وتبديل (تلفون عطلان)</button>'
+      +'<button class="btn btn-outline btn-sm" onclick="approveDeviceAsk(\''+d.id+'\',\'add\')">➕ اعتماد كجهاز ثانٍ</button>'
+      +'<button class="btn btn-danger btn-sm" onclick="rejectDeviceAsk(\''+d.id+'\')">🚫 رفض (مشكوك)</button></div></div>';
+  }).join('') : '<div class="empty card"><span class="ic">✅</span>ماكو طلبات أجهزة معلقة — كل شيء نظيف.</div>';
+
+  html+='<h3 style="font-size:17px;font-weight:900;margin:24px 0 12px">📱 كل الأجهزة المسجلة ('+devs.length+')</h3>';
+  html+='<div class="table-wrap"><table class="ptable"><tr><th>المالك</th><th>الجهاز</th><th>البصمة</th><th>الحالة</th><th>آخر استخدام</th><th></th></tr>'
+    +devs.map(function(d){
+      return '<tr'+(d.status==='revoked'?' style="opacity:.55"':'')+'><td><b>'+esc(d.name||'—')+'</b></td><td>'+esc(d.label||'—')+(d.note?'<br><span style="font-size:11px;color:var(--faint)">'+esc(d.note)+'</span>':'')+'</td><td style="direction:ltr;font-size:12px">'+esc(d.fp)+'…</td>'
+        +'<td>'+(d.status==='active'?'<span class="chip chip-green">✓ فعّال</span>':d.status==='pending'?'<span class="chip chip-amber">⏳ معلق</span>':'<span class="chip chip-gray">ملغى</span>')+'</td>'
+        +'<td style="white-space:nowrap;font-size:12px">'+(d.lastSeen?timeAgo(d.lastSeen):'—')+'</td>'
+        +'<td>'+(d.status==='active'?'<button class="btn btn-ghost btn-sm" onclick="revokeDeviceAsk(\''+d.id+'\')">📵 إلغاء</button>':'')+'</td></tr>';
+    }).join('')+'</table></div>';
+
+  html+='<h3 style="font-size:17px;font-weight:900;margin:24px 0 12px">🧾 سجل الأحداث الأمنية (آخر '+evs.length+')</h3>';
+  html+= evs.length? evs.map(function(x){
+    var who=x.profileId?(userById(x.profileId)||{}).name||'':'';
+    var detail='';
+    try{ detail=Object.keys(x.meta||{}).map(function(k){return k+': '+x.meta[k];}).join(' · ');}catch(e){}
+    return '<div class="req-card" style="padding:10px 14px"><div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap"><span style="font-size:17px">'+(evIcon[x.kind]||'🔎')+'</span><b style="font-size:13px">'+esc(x.kind)+'</b><span style="font-size:12.5px;color:var(--muted)">'+esc(who)+(x.ip?' · <span style="direction:ltr;display:inline-block">'+esc(x.ip)+'</span>':'')+(detail?' · '+esc(detail):'')+'</span><span style="margin-inline-start:auto;font-size:11.5px;color:var(--faint)">'+timeAgo(x.at)+'</span></div></div>';
+  }).join('') : '<div class="empty card"><span class="ic">🧾</span>ماكو أحداث مسجلة بعد.</div>';
+
+  $('adminRoot').innerHTML=html;
 }
 
 // v8.5 — يعيد بناء جدول عمولات الأدمن بعد العرض: كل معلومات الطلب + القيم الموثقة من الدفتر (مو حساب محلي)
