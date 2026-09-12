@@ -168,10 +168,11 @@ function verifyPassword(pw, stored) {
   } catch (e) { return false }
 }
 
-// ---- Cloudflare Turnstile — يشتغل فقط عند ضبط TURNSTILE_SECRET -----------
+// ---- Cloudflare Turnstile — يشتغل فقط عند ضبط زوج المفاتيح كاملاً -----------
 //  التوكن أحادي الاستخدام وصالح 300 ثانية؛ التحقق السيرفري إلزامي (وثائق كلاودفلير).
+//  v8.8 — لازم السر والمفتاح العلني معاً؛ نصف الضبط = غير مفعّل (لا قفل ذاتي للموقع).
 async function verifyTurnstile(token, ip) {
-  if (!ENV.TURNSTILE_SECRET) return true // غير مفعّل — تخطَّ بهدوء (وضع التطوير)
+  if (!ENV.TURNSTILE_SECRET || !ENV.TURNSTILE_SITE_KEY) return true // غير مفعّل (لازم الزوج كاملاً) — تخطَّ بهدوء
   if (!token || typeof token !== 'string' || token.length > 2048) return false
   try {
     const r = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
