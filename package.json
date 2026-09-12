@@ -1,6 +1,6 @@
 {
   "name": "mdllni",
-  "version": "8.7.0",
+  "version": "8.8.0",
   "private": true,
   "description": "مدللني — منصة خدمات الناصرية (Vercel + Supabase)",
   "type": "commonjs",
