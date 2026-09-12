@@ -326,7 +326,7 @@ create table if not exists ur_email_otps (
   id bigserial primary key,
   email text not null,
   code_hash text not null,
-  purpose text not null check (purpose in ('register','login','device')),
+  purpose text not null check (purpose in ('register','login','device','bind')),
   attempts int not null default 0,
   expires_at timestamptz not null,
   consumed_at timestamptz,
