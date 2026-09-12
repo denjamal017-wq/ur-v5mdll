@@ -68,7 +68,7 @@ async function noteRegistration(ip, deviceId, phone) {
     const items = await regPhones(key)
     if (items.indexOf(phone) < 0) {
       items.push(phone)
-      await rlSet(key, items.length, items.slice(-20))
+      await rlSet(key, items.length, Date.now(), items.slice(-20))
     }
   }
 }
