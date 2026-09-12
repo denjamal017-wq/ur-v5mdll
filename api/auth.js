@@ -1,10 +1,12 @@
-// POST /api/auth  { action: 'register' | 'login' | 'verifyOtp' | 'resendOtp' | 'me', ... }
+// POST /api/auth  { action: 'register' | 'login' | 'verifyOtp' | 'resendOtp' | 'bindEmail' | 'me', ... }
 //  v8.0 — هوية أقوى بكثير:
 //  · بريد إلزامي + رمز OTP بخطوتين للتسجيل والدخول (بدل الاعتماد على الهاتف فقط)
 //  · جهاز واحد = حساب واحد (فهرس فريد بالقاعدة) — الجهاز الجديد لحساب قائم
 //    يحتاج رمز بريد ثم موافقة الإدارة (تبديل الهاتف العطلان بدون فقدان الحساب)
 //  · آخر IP موثّق للحساب (شبكة مكافحة التواطؤ بالمحرك) + أحداث أمنية دائمة
 //  · Cloudflare Turnstile اختياري عند ضبط المفاتيح + كبح القوة الغاشمة الدائم
+//  v8.8 — سد ثغرة: حساب بريده غير مفعّل ما يدخل بلا رمز (المسار المتساهل صار فقط
+//  لمن لا بريد له إطلاقاً) + bindEmail: ربط إجباري لبريد الحسابات القديمة
 const { cors, json, readBody, dal, hashPassword, verifyPassword, signToken, getToken, verifyToken, verifyTurnstile, crypto, ENV } = require('./_lib')
 const { provisionAdmin } = require('./_engine')
 const { sendOtpEmail } = require('./_mail')
@@ -66,7 +68,7 @@ async function noteRegistration(ip, deviceId, phone) {
     const items = await regPhones(key)
     if (items.indexOf(phone) < 0) {
       items.push(phone)
-      await rlSet(key, items.length, Date.now(), items.slice(-20))
+      await rlSet(key, items.length, items.slice(-20))
     }
   }
 }
@@ -227,6 +229,7 @@ module.exports = async function handler(req, res) {
     if (action === 'login') return await login(res, body, req)
     if (action === 'verifyOtp') return await verifyOtpAction(res, body, req)
     if (action === 'resendOtp') return await resendOtp(res, body, req)
+    if (action === 'bindEmail') return await bindEmail(res, body, req)
     if (action === 'me') return await me(req, res)
     return json(res, 400, { ok: false, error: 'unknown_action' })
   } catch (e) {
@@ -397,8 +400,10 @@ async function login(res, b, req) {
   }
   const known = !!(await activeDevice(profile.id, deviceId))
 
-  if (profile.email_verified && profile.email) {
-    const purpose = known ? 'login' : 'device'
+  // v8.8 — كل حساب عنده بريد يمر بالرمز حتماً: غير المفعّل يكمّل رمز التفعيل (register)،
+  // والمسار المتساهل بالأسفل صار فقط لمن لا بريد له إطلاقاً — ماكو التفاف على OTP
+  if (profile.email) {
+    const purpose = !profile.email_verified ? 'register' : (known ? 'login' : 'device')
     let extra = {}
     try {
       extra = await issueOtp(profile.email, purpose, ip)
@@ -409,7 +414,7 @@ async function login(res, b, req) {
       }
       throw e
     }
-    const pending = signToken({ scope: 'otp', purpose: purpose, sub: profile.id, ph: phone, fp: deviceId }, 0.007)
+    const pending = signToken({ scope: 'otp', purpose: purpose, sub: profile.id, ph: phone, em: profile.email, fp: deviceId }, 0.007)
     return json(res, 200, Object.assign({ ok: true, needsOtp: true, pending: pending, email: profile.email, newDevice: !known }, extra))
   }
 
@@ -423,6 +428,26 @@ async function login(res, b, req) {
   }
   const token = signToken({ sub: profile.id, role: profile.role, phone: profile.phone, dv: deviceId })
   return json(res, 200, { ok: true, token: token, userId: profile.id, role: profile.role, needsEmail: !profile.email })
+}
+
+// v8.8 — ربط بريد لحساب قديم (يتطلب جلسة صالحة): يرسل رمزاً لغرض bind
+async function bindEmail(res, b, req) {
+  const token = getToken(req)
+  const payload = token && verifyToken(token)
+  if (!payload || payload.scope === 'otp') return json(res, 401, { ok: false, error: 'unauthorized' })
+  const profile = await dal.find('ur_profiles', { id: payload.sub })
+  if (!profile) return json(res, 404, { ok: false, error: 'user_not_found' })
+  if (profile.email && profile.email_verified) return json(res, 409, { ok: false, error: 'email_taken' })
+  const email = String(b.email || '').trim().toLowerCase()
+  if (!EMAIL_RE.test(email)) return json(res, 400, { ok: false, error: 'bad_email' })
+  // الربط المتقاطع ممنوع: بريد مربوط برقم آخر ما ينربط لرقمك — والعكس بالتسجيل
+  const dup = await dal.find('ur_profiles', { email: email })
+  if (dup && dup.id !== profile.id) return json(res, 409, { ok: false, error: 'email_taken' })
+  const ip = getClientIp(req)
+  const extra = await issueOtp(email, 'bind', ip)
+  const pending = signToken({ scope: 'otp', purpose: 'bind', sub: profile.id, em: email, fp: payload.dv || '' }, 0.007)
+  await secEvent(profile.id, 'bind_email_issued', {}, ip)
+  return json(res, 200, Object.assign({ ok: true, needsOtp: true, pending: pending, email: email }, extra))
 }
 
 async function verifyOtpAction(res, b, req) {
@@ -483,6 +508,14 @@ async function verifyOtpAction(res, b, req) {
     await notifyAdmins('🛡️', 'طلب تبديل جهاز: ' + profile.name + ' (' + profile.phone + ') — راجع تبويب الأمان', null)
     await secEvent(profile.id, 'device_pending_approval', {}, ip)
     return json(res, 200, { ok: true, needsDeviceApproval: true, message: '🛡️ جهازك الجديد ينتظر موافقة الإدارة.' })
+  }
+
+  if (payload.purpose === 'bind') {
+    const dup = await dal.find('ur_profiles', { email: email })
+    if (dup && dup.id !== profile.id) return json(res, 409, { ok: false, error: 'email_taken' })
+    await dal.update('ur_profiles', { id: profile.id }, { email: email, email_verified: true })
+    await secEvent(profile.id, 'email_bound', {}, ip)
+    return json(res, 200, { ok: true, bound: true, email: email })
   }
 
   return json(res, 400, { ok: false, error: 'bad_pending' })
