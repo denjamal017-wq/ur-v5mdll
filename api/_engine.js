@@ -480,7 +480,7 @@ async function runAction(actor, action, p) {
         .filter((x) => x.cancelled_by === actor.id && toMs(x.created_at) > dayAgo).length
       need(myCancels < 3, 'cancel_abuse')
       const seq = await dal.nextSeq('order', 1042)
-      const id = 'UR-' + seq
+      const id = 'MD-' + seq
       // كشف التعامل الذاتي: تطابق بصمة جهاز الزبون مع جهاز أي مقدم مطابق
       // → الطلب يُعلَّم للإدارة ويُخفى ع�� ذلك المق��م تحديداً
       const myDevices = actor.devices || []
@@ -800,7 +800,7 @@ async function runAction(actor, action, p) {
       let adjOrderId = null
       if (amount < 0) {
         adjOrderId = String(p.orderId || '').trim()
-        need(/^UR-\d+$/.test(adjOrderId), 'bad_body')
+        need(/^(UR|MD)-\d+$/.test(adjOrderId), 'bad_body')
         const refOrder = await getOrder(adjOrderId)
         need(refOrder && refOrder.provider_id === p.userId, 'order_not_found')
         const monthAgo = Date.now() - 30 * 86400000

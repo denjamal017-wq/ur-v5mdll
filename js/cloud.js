@@ -4,7 +4,9 @@
         رؤية الطلبات المعلقة للمقدم + واجهة الذمة المالية + إصلاح نص مكسور.
    v8.6 — طبقة الهوية: بريد + رمز OTP بخطوتين (تسجيل/دخول/جهاز جديد) + ربط الجهاز
         (جهاز واحد = حساب واحد) + تبويب «الأمان» للإدارة + «أجهزتي» للمستخدم
-        + Turnstile عند تفعيله + إصلاح إيموجي «منطقة الخطر» المتضرر بالمحرر. */
+        + Turnstile عند تفعيله + إصلاح إيموجي «منطقة الخطر» المتضرر بالمحرر.
+   v8.7 — حقل البريد وحاويات Turnstile صارت أصيلة داخل app.js (لا زرع DOM) + بادئة
+        أرقام الطلبات الجديدة MD- (مدللني) بدل UR- — إزالة كاملة لاسم المنصة القديم. */
 (function(){
 'use strict';
 
@@ -583,24 +585,13 @@ function installCloud(){
     document.head.appendChild(s);
   }
 
-  // بعد كل render: نزرع حقل البريد بفورم التسجيل + حاويات Turnstile (مرة وحدة لكل فورم)
+  // v8.7 — الحقول صارت أصيلة بـ app.js؛ هنا فقط نحدّث ودجت Turnstile بعد كل render
   var _origRender = (typeof render==='function') ? render : null;
   window.render = function(){
     if(_origRender) _origRender.apply(this, arguments);
-    setTimeout(function(){
-      try{
-        var rp=$('rgPhone');
-        if(rp && !$('rgEmail') && rp.closest('.field')) rp.closest('.field').insertAdjacentHTML('afterend','<div class="field"><label>📧 البريد الإلكتروني (رمز التحقق يوصلك عليه)</label><input id="rgEmail" type="email" dir="ltr" placeholder="name@gmail.com" autocomplete="email"></div>');
-        var lg=$('lgPass');
-        if(window._turnstileSiteKey){
-          if(lg && !$('lgTurnstile') && lg.closest('.field')) lg.closest('.field').insertAdjacentHTML('afterend','<div class="field" id="lgTurnstile"></div>');
-          var rg=$('rgArea');
-          if(rg && !$('rgTurnstile') && rg.closest('.field')) rg.closest('.field').insertAdjacentHTML('afterend','<div class="field" id="rgTurnstile"></div>');
-          renderTurnstileWidgets();
-        }
-      }catch(e){}
-    }, 60);
+    if(window._turnstileSiteKey) setTimeout(function(){ try{ renderTurnstileWidgets(); }catch(e){} }, 60);
   };
+
   fetch(API_BASE+'/health').then(function(r){ return r.json(); }).then(function(j){
     if(j && j.turnstileSiteKey){ window._turnstileSiteKey=j.turnstileSiteKey; installTurnstile(); }
   }).catch(function(){});

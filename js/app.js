@@ -718,6 +718,7 @@ function renderAuth(mode){
       <p style="font-size:14px;color:var(--muted);margin-bottom:22px">سجّل دخولك برقم هاتفك وكلمة المرور.</p>
       <div class="field"><label>رقم الهاتف</label><input id="lgPhone" placeholder="07XXXXXXXXX" inputmode="tel" maxlength="15" value="${esc(window._lastPhone||'')}"></div>
       <div class="field"><label>كلمة المرور</label><input id="lgPass" type="password" placeholder="••••••••" onkeydown="if(event.key==='Enter')doLogin()"></div>
+      <div id="lgTurnstile" style="margin:4px 0 14px"></div>
       <button class="btn btn-primary btn-block" onclick="doLogin()">دخول ←</button>
       <div style="text-align:center;margin-top:16px"><a style="font-size:13.5px;color:var(--muted);cursor:pointer" onclick="go('#/auth/register')">ما عندك حساب؟ <b style="color:var(--ink)">سجّل الآن مجاناً</b></a></div>
     </div>`;
@@ -728,13 +729,14 @@ function renderAuth(mode){
   <div class="auth-card">
     <div class="auth-tabs"><button onclick="go('#/auth/login')">تسجيل الدخول</button><button class="active">حساب جديد</button></div>
     <h3 style="font-size:21px;font-weight:900;margin-bottom:6px">📝 أنشئ حسابك الجديد</h3>
-    <p style="font-size:14px;color:var(--muted);margin-bottom:20px">دقيقة واحدة وتصير داخل منظومة مدللني.</p>
+    <p style="font-size:14px;color:var(--muted);margin-bottom:20px">دقيقة واحدة وتصير داخل منظومة مدللني — بريدك الإلكتروني مطلوب لاستلام رمز التحقق.</p>
     <div class="role-pick">
       <div class="rp ${!isProv?'sel':''}" onclick="pickRole('customer')"><span class="ic">🧑</span><b>زبون</b><span>أطلب خدمات لبيتي</span></div>
       <div class="rp ${isProv?'sel':''}" onclick="pickRole('provider')"><span class="ic">🧑‍🔧</span><b>مقدم خدمة</b><span>أشتغل وأستلم طلبات</span></div>
     </div>
     <div class="field"><label>الاسم الكامل</label><input id="rgName" placeholder="مثلاً: حيدر كريم"></div>
     <div class="field"><label>رقم الهاتف</label><input id="rgPhone" placeholder="07XXXXXXXXX" inputmode="tel" maxlength="15" value="${esc(window._lastPhone||'')}"></div>
+    <div class="field"><label>📧 البريد الإلكتروني (يوصلك عليه رمز التحقق — حماية ثانية لحسابك)</label><input id="rgEmail" type="email" dir="ltr" placeholder="name@gmail.com" autocomplete="email"></div>
     <div class="grid grid-2" style="gap:12px">
       <div class="field"><label>كلمة المرور</label><input id="rgPass" type="password" placeholder="6 أحرف على الأقل"></div>
       <div class="field"><label>تأكيد كلمة المرور</label><input id="rgPass2" type="password" placeholder="أعد كتابتها"></div>
@@ -746,6 +748,7 @@ function renderAuth(mode){
         ${['الحبوبي / المركز', 'شارع 40', 'الإدارة المحلية', 'حي المعلمين', 'حي الحسين', 'حي الشموخ', 'حي سومر', 'صوب الشامية', 'صوب الجزيرة'].map(a=>`<button type="button" class="area-tag" onclick="$('rgArea').value='${a}'">${a}</button>`).join('')}
       </div>
     </div>
+    <div id="rgTurnstile" style="margin:4px 0 14px"></div>
     <div id="rgProvFields" style="display:${isProv?'block':'none'}">
       <div class="field">
         <label style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
@@ -1042,7 +1045,7 @@ function bookConfirm(est){
   const u=me(); if(!u){ requireAuth('#/book'); return; }
   const s=svc(bookState.serviceId);
   const o={
-    id:'UR-'+(DB.meta.orderSeq++),
+    id:'MD-'+(DB.meta.orderSeq++),
     serviceId:s.id, customerId:u.id, providerId:null,
     desc:bookState.desc, area:bookState.area, address:bookState.address,
     when:bookState.when, whenTime:bookState.whenTime, payMethod:bookState.pay,

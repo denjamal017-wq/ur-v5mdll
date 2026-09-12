@@ -1,66 +1,55 @@
 # 🏛️ مدللني mdllni — منصة خدمات الناصرية
 
 منصة حقيقية متكاملة (ليست وهمية) تربط الزبائن بمقدمي الخدمات في الناصرية / ذي قار.
+الإصدار الحالي: **v8.7** — تحقق بخطوتين عبر البريد (OTP) · جهاز واحد = حساب واحد · ذمة ذرية بالقاعدة · 241 حالة احتيال موثقة ومعالَجة.
 
-- **الواجهة:** `index.html` (الهيكل) + `css/style.css` (التصميم) + `js/app.js` (منطق التطبيق) + `js/cloud.js` (طبقة السحابة) — HTML/CSS/JS مباشر بدون خطوة بناء.
-- **الخادم:** دوال Vercel Serverless داخل مجلد `api/`.
-- **قاعدة البيانات:** Supabase (PostgreSQL) — جداول حقيقية + RLS.
-- **وضع مزدوج:** إذا لم تُضبط متغيرات Supabase تشتغل المنصة تلقائياً بوضع تجريبي محلي (localStorage) — مفيد للعرض.
-
----
-
-## 🗄️ الجداول (14 جدول)
-`ur_categories, ur_services, ur_profiles, ur_providers, ur_orders, ur_reviews, ur_order_messages, ur_notifications, ur_tickets, ur_ticket_messages, ur_payouts, ur_audit_log, ur_settings, ur_counters`
-
----
+## 🧱 البنية
+- **الواجهة:** `index.html` + `css/style.css` + `js/app.js` (منطق التطبيق) + `js/cloud.js` (طبقة السحابة) — HTML/CSS/JS مباشر بدون خطوة بناء.
+- **الخادم:** دوال Vercel Serverless داخل `api/` (`_engine` قواعد العمل · `auth` الهوية · `data` البوابة · `_lib` الأدوات · `_mail` البريد · `health` الفحص).
+- **القاعدة:** Supabase (PostgreSQL) — 19 جدولاً حقيقياً + RLS كامل (الوصول فقط عبر service_role من الخادم).
+- **وضع مزدوج:** بدون متغيرات Supabase تشتغل المنصة بوضع عرض محلي (localStorage) — للتجربة فقط.
 
 ## 🚀 التشغيل خطوة بخطوة
 
 ### 1) Supabase
-1. روح لـ https://supabase.com → أنشئ مشروع جديد (اختر Region قريب مثل Frankfurt).
-2. من القائمة افتح **SQL Editor** → الصق كل محتوى `supabase/schema.sql` → **Run**.
-3. رح تنزرع الجداول + 8 تصنيفات + 30 خدمة + الإعدادات.
-4. من **Project Settings → API** انسخ:
-   - `Project URL`  → يصير `SUPABASE_URL`
-   - `service_role` secret → يصير `SUPABASE_SERVICE_ROLE_KEY` (سرّي جداً)
+1. أنشئ مشروعاً على https://supabase.com (اختر Region قريب).
+2. **SQL Editor** → الصق كل محتوى `supabase/schema.sql` → **Run** — تنزرع الجداول الـ19 + التصنيفات والخدمات + الإعدادات + دالة الذمة الذرية (يشمل ترقيات v7→v12).
+3. من **Project Settings → API** انسخ `Project URL` و`service_role`.
 
-### 2) الرفع على Vercel
-1. ارفع المجلد لـ GitHub ثم Import في Vercel (أو `vercel` من التيرمنال).
-2. Framework Preset = **Other** (بدون بناء).
-3. في **Settings → Environment Variables** حط المتغيرات (شوف `.env.example`):
-   - `SUPABASE_URL`
-   - `SUPABASE_SERVICE_ROLE_KEY`
-   - `JWT_SECRET`  (نص عشوائي طويل — ولّده بـ `openssl rand -hex 32`)
-   - `ADMIN_PHONE` (افتراضي 07800000000)
-   - `ADMIN_PASSWORD` (غيّره!)
-4. Deploy. خلاص.
+### 2) Vercel
+1. ارفع المجلد لـ GitHub ثم Import في Vercel (Framework Preset = **Other**).
+2. **Settings → Environment Variables** حسب `.env.example`:
+   - الأساسية: `SUPABASE_URL` · `SUPABASE_SERVICE_ROLE_KEY` · `JWT_SECRET` · `ADMIN_PHONE` · `ADMIN_PASSWORD` · `ADMIN_NAME`
+   - **البريد (مطلوب لرمز التحقق):** `MAIL_PROVIDER` · `MAIL_API_KEY` · `MAIL_FROM`
+   - اختياري (ضد البوتات): `TURNSTILE_SITE_KEY` · `TURNSTILE_SECRET`
+3. Deploy → تحقق: `/api/health` يرجّع `"version":"v8"` و`mailReady:true`.
 
 ### 3) دخول الإدارة
-أول ما يشتغل الـ API يُنشأ حساب الإدارة تلقائياً من `ADMIN_PHONE` / `ADMIN_PASSWORD`.
-ادخل من زر “دخول” بالرقم والباسورد.
+حساب الإدارة يُنشأ تلقائياً من `ADMIN_PHONE`/`ADMIN_PASSWORD`. أول دخول من جهاز جديد لحساب قديم بلا بريد يُفعَّل مباشرة (مع تنبيه) — أضف بريد الإدارة لاحقاً. راقب الأجهزة والطلبات من تبويب **🛡️ الأمان**.
 
----
+## 🔐 الأمان (إصدار الهوية v8)
+- **OTP بالبريد:** 6 أرقام (scrypt) — صلاحية 10 دقائق · 5 محاولات · كولداون دقيقة · حد 8 يومياً — للتسجيل والدخول والجهاز الجديد.
+- **جهاز واحد = حساب واحد:** فهرس فريد بالقاعدة؛ الحساب الثاني من نفس الجهاز يُرفض (`device_in_use`).
+- **تبديل التلفون العطلان:** جهاز جديد → رمز بريد → «معلق» → الإدارة تعتمد من تبويب الأمان (تبديل يلغي القديم).
+- **إلغاء جهاز يقتل جلسته فوراً** (401 `device_revoked`).
+- **شبكة التواطؤ:** تطابق جهاز أو آخر IP بين زبون ومقدم مطابق → استبعاد + تعليم 🚨 + حدث أمني موثّق.
+- **الذمة الذرية:** `ur_apply_debt` RPC بمعاملة واحدة — سباق الإكمال المزدوج يقيّد عمولة واحدة فقط (مُختبَر).
+- الباسوردات scrypt · الجلسات JWT (HS256) مربوطة ببصمة الجهاز · Turnstile اختياري.
 
 ## 🔌 الـ API
 | المسار | الوظيفة |
 |------|--------|
-| `GET /api/health` | يقرّر الوضع (cloud/local) |
-| `POST /api/auth` | `register` / `login` / `me` |
-| `POST /api/data` | `snapshot` + كل العمليات (قبول طلب، تسعير، توثيق، تسوية…) |
+| `GET /api/health` | الوضع + الإعدادات العامة (`turnstileSiteKey`, `mailReady`) |
+| `POST /api/auth` | `register` / `login` / `verifyOtp` / `resendOtp` / `me` |
+| `POST /api/data` | `snapshot` + كل العمليات (قبول، تسعير، توثيق، أجهزة، تسوية…) |
 
-الجلسات عبر JWT (HS256) + الباسوردات مشفّرة بـ scrypt على الخادم (مو بالمتصفّح).
-
----
-
-## 🧪 اختبار محلي (بدون إنترنت)
+## 🧪 الاختبارات
 ```bash
-node test-cloud.js
+npm test        # node test/security-v8.js
 ```
-يشغّل دورة كاملة (تسجيل → توثيق → طلب → قبول → تنفيذ → تقييم → تسوية) على نفس كود الخادم مع قاعدة بيانات في الذاكرة.
+**38/38 ✅** بدون شبكة — قاعدة وهمية بالذاكرة تغطي: OTP كاملاً، قفل المحاولات، جهاز=حساب، تبديل/إلغاء الأجهزة، قتل الجلسات، تواطؤ IP، سباق العمولة، Turnstile، عزل صلاحيات السنابشوت.
 
----
-
-## 🔐 أمان
-- **دوّر توكن Vercel** اللي نشرته بالمحادثة (اعتبره مكشوف). Account Settings → Tokens → احذف القديم → أنشئ جديد.
-- `service_role` و`JWT_SECRET` يبقون بالـ Environment Variables فقط — لا تحطهم بالكود.
-- كل الجداول RLS مفعّل (الوصول فقط عبر service_role من الخادم).
+## ⚠️ ملاحظات
+- أرقام الطلبات الجديدة ببادئة `MD-` (مدللني)؛ الطلبات القديمة `UR-` تبقى مقبولة ومحفوظة بالنظام.
+- أمان الحساب صار بقوة بريد صاحبه — شجّع المستخدمين على بريد قوي.
+- أي سرّ انكشف سابقاً (توكنات Vercel القديمة مثلاً) دوّره فوراً من لوحة المزود.

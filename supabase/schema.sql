@@ -1,5 +1,5 @@
 -- =====================================================================
---  أور UR — Supabase / PostgreSQL schema  (v6)
+--  مدللني mdllni — Supabase / PostgreSQL schema  (v8.12 — كامل حتى ترحيل الهوية)
 --  شغّل هذا الملف مرة واحدة من:  Supabase Dashboard > SQL Editor > New query
 --  كل الجداول محمية بـ RLS ولا يمكن الوصول لها إلا من السيرفر (service_role)
 -- =====================================================================
@@ -259,6 +259,115 @@ insert into ur_settings(key,value) values
  ('areas','["الحبوبي","الحي العسكري","شارع 40","الإسكان","الزهراء","سومر","الشموخ","أور","الحي الصناعي","القادسية","7 نيسان","حي الحسين"]'::jsonb)
 on conflict (key) do nothing;
 
--- العدّادات تُزرع تلقائياً أول طلب/تذكرة/تسوية (UR-1042 / T-1 / PO-1)
+-- العدّادات تُزرع تلقائياً أول طلب/تذكرة/تسوية (MD-1043 / T-1 / PO-1)
 
 -- تم. حساب الإدارة يُنشأ تلقائياً من متغيرات ADMIN_PHONE / ADMIN_PASSWORD أول مرة يشتغل الـ API.
+
+-- =====================================================================
+--  ترقيات v7 → v12 (الذمة والهوية والأجهزة) — idempotent وآمنة للتكرار
+--  (بالقاعدة الحية مطبقة أصلاً؛ هنا حتى التثبيت الجديد يطلع كاملاً بمرة وحدة)
+-- =====================================================================
+-- v7 — دفتر الذمة + العمولة الموثقة بالطلب
+alter table ur_orders add column if not exists commission_amount bigint;
+alter table ur_orders add column if not exists rounding_delta int not null default 0;
+alter table ur_providers add column if not exists debt bigint not null default 0 check (debt >= 0);
+alter table ur_profiles add column if not exists devices text[] not null default '{}';
+create table if not exists ur_ledger (
+  id bigserial primary key,
+  provider_id uuid not null references ur_profiles(id) on delete cascade,
+  order_id text references ur_orders(id) on delete set null,
+  kind text not null check (kind in ('commission','payment','adjustment')),
+  amount bigint not null,
+  balance_after bigint not null,
+  note text not null default '',
+  created_at timestamptz not null default now()
+);
+create index if not exists ur_ledger_provider_idx on ur_ledger(provider_id, created_at desc);
+
+-- v9 — مقاييس سلوك المقدمين
+alter table ur_providers add column if not exists resp_sum bigint not null default 0;
+alter table ur_providers add column if not exists resp_count int not null default 0;
+alter table ur_providers add column if not exists drop_count int not null default 0;
+
+-- v10 — الأعمال الإضافية الميدانية
+alter table ur_orders add column if not exists extras jsonb not null default '[]'::jsonb;
+
+-- v11 — حدود معدل دائمة + عمولة وحيدة لكل طلب
+create table if not exists ur_rate_limits (
+  key text primary key,
+  count int not null default 0,
+  first bigint not null default 0,
+  items jsonb not null default '[]'::jsonb,
+  updated_at timestamptz not null default now()
+);
+create unique index if not exists ur_ledger_commission_order_uniq on ur_ledger(order_id) where kind = 'commission' and order_id is not null;
+
+-- v12 — الهوية: بريد + OTP + أجهزة + أحداث أمنية + ذمة ذرية
+alter table ur_profiles add column if not exists email text;
+alter table ur_profiles add column if not exists email_verified boolean not null default false;
+alter table ur_profiles add column if not exists last_ip text not null default '';
+create unique index if not exists ur_profiles_email_uniq on ur_profiles(lower(email)) where email is not null;
+
+create table if not exists ur_devices (
+  id bigserial primary key,
+  profile_id uuid not null references ur_profiles(id) on delete cascade,
+  fingerprint text not null,
+  label text not null default '',
+  status text not null default 'active' check (status in ('active','pending','revoked')),
+  note text not null default '',
+  created_at timestamptz not null default now(),
+  last_seen timestamptz not null default now()
+);
+create unique index if not exists ur_devices_active_fp on ur_devices(fingerprint) where status = 'active';
+create unique index if not exists ur_devices_profile_fp on ur_devices(profile_id, fingerprint) where status = 'active';
+create index if not exists ur_devices_profile_idx on ur_devices(profile_id);
+
+create table if not exists ur_email_otps (
+  id bigserial primary key,
+  email text not null,
+  code_hash text not null,
+  purpose text not null check (purpose in ('register','login','device')),
+  attempts int not null default 0,
+  expires_at timestamptz not null,
+  consumed_at timestamptz,
+  created_at timestamptz not null default now()
+);
+create index if not exists ur_email_otps_idx on ur_email_otps(email, purpose, created_at desc);
+
+create table if not exists ur_security_events (
+  id bigserial primary key,
+  profile_id uuid references ur_profiles(id) on delete set null,
+  kind text not null,
+  meta jsonb not null default '{}'::jsonb,
+  ip text not null default '',
+  created_at timestamptz not null default now()
+);
+create index if not exists ur_security_events_idx on ur_security_events(created_at desc);
+
+create or replace function ur_apply_debt(p_provider uuid, p_amount bigint, p_kind text, p_order text, p_note text)
+returns jsonb language plpgsql security definer set search_path = public as $$
+declare v_debt bigint;
+begin
+  update ur_providers set debt = greatest(0, coalesce(debt, 0) + p_amount) where profile_id = p_provider returning debt into v_debt;
+  if not found then raise exception 'provider_not_found'; end if;
+  begin
+    insert into ur_ledger(provider_id, order_id, kind, amount, balance_after, note, created_at)
+    values (p_provider, nullif(p_order, ''), p_kind, p_amount, v_debt, coalesce(p_note, ''), now());
+  exception when unique_violation then
+    update ur_providers set debt = greatest(0, coalesce(debt, 0) - p_amount) where profile_id = p_provider;
+    raise;
+  end;
+  return jsonb_build_object('debt', v_debt);
+end $$;
+revoke all on function ur_apply_debt(uuid, bigint, text, text, text) from public, anon, authenticated;
+grant execute on function ur_apply_debt(uuid, bigint, text, text, text) to service_role;
+
+alter table ur_ledger enable row level security;
+alter table ur_rate_limits enable row level security;
+alter table ur_devices enable row level security;
+alter table ur_email_otps enable row level security;
+alter table ur_security_events enable row level security;
+
+insert into ur_settings(key,value) values
+ ('debt','{"warnAt":25000,"blockAt":50000,"roundingUnit":250,"maxOpenOrders":3,"loyalMinCustomers":6,"eliteMinCustomers":15}'::jsonb)
+on conflict (key) do nothing;

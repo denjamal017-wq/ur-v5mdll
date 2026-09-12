@@ -10,7 +10,7 @@ const ENV = {
   JWT_SECRET: process.env.JWT_SECRET || '',
   ADMIN_PHONE: process.env.ADMIN_PHONE || '07800000000',
   ADMIN_PASSWORD: process.env.ADMIN_PASSWORD || 'ur-admin-2026',
-  ADMIN_NAME: process.env.ADMIN_NAME || '\u0625\u062f\u0627\u0631\u0629 \u0623\u0648\u0631',
+  ADMIN_NAME: process.env.ADMIN_NAME || '\u0625\u062f\u0627\u0631\u0629 \u0645\u062f\u0644\u0644\u0646\u064a',
   // v8.0 — البريد (OTP) والتحقق من البشر (Cloudflare Turnstile)
   MAIL_PROVIDER: process.env.MAIL_PROVIDER || '',
   MAIL_API_KEY: process.env.MAIL_API_KEY || '',
