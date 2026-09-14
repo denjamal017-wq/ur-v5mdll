@@ -353,19 +353,21 @@ async function register(res, b, req) {
     } catch (_) {}
   }
 
-  // البريد هو بوابة التفعيل: لا جلسة قبل رمز البريد
+  // البريد هو بوابة التفعيل — وإذا تعطلت سوبابيس أو بلغت الحد، لا نشنق المستخدم بل نفعّله مباشرة
   let extra = {}
   try {
     extra = await issueOtp(email, 'register', ip)
+    const pending = signToken({ scope: 'otp', purpose: 'register', sub: profile.id, ph: phone, em: email, fp: fraudCheck.deviceId }, 0.007)
+    await secEvent(profile.id, 'register_pending_otp', {}, ip)
+    return json(res, 200, Object.assign({ ok: true, needsOtp: true, pending: pending, email: email }, extra))
   } catch (e) {
-    if (e.code === 'mail_not_configured' || e.code === 'mail_failed') {
-      await notifyAdmins('📧', 'خدمة الرموز متعطلة — حساب ' + name + ' (' + phone + ') ينتظر رمز التفعيل. فعّل Email provider من لوحة Supabase ← Authentication', null)
-      extra = { mailPending: true }
-    } else throw e
+    if (e.code === 'mail_not_configured' || e.code === 'mail_failed' || e.code === 'otp_limit') {
+      await activateDevice(profile, fraudCheck.deviceId, req.headers['user-agent'], ip)
+      const token = signToken({ sub: profile.id, role: profile.role, phone: profile.phone, dv: fraudCheck.deviceId })
+      return json(res, 200, { ok: true, token: token, userId: profile.id, role: profile.role, directLogin: true })
+    }
+    throw e
   }
-  const pending = signToken({ scope: 'otp', purpose: 'register', sub: profile.id, ph: phone, em: email, fp: fraudCheck.deviceId }, 0.007)
-  await secEvent(profile.id, 'register_pending_otp', {}, ip)
-  return json(res, 200, Object.assign({ ok: true, needsOtp: true, pending: pending, email: email }, extra))
 }
 
 async function login(res, b, req) {
@@ -431,15 +433,20 @@ async function login(res, b, req) {
     let extra = {}
     try {
       extra = await issueOtp(profile.email, purpose, ip)
+      const pending = signToken({ scope: 'otp', purpose: purpose, sub: profile.id, ph: phone, em: profile.email, fp: deviceId }, 0.007)
+      return json(res, 200, Object.assign({ ok: true, needsOtp: true, pending: pending, email: profile.email, newDevice: !known }, extra))
     } catch (e) {
-      if (e.code === 'mail_not_configured' || e.code === 'mail_failed') {
-        await notifyAdmins('📧', 'خدمة الرموز متعطلة — ' + profile.name + ' ما يكدر يسجّل دخول (OTP). فعّل Email provider من Supabase', null)
-        return json(res, 503, { ok: false, error: 'mail_not_configured' })
+      if (e.code === 'mail_not_configured' || e.code === 'mail_failed' || e.code === 'otp_limit') {
+        // إذا كان البريد معطلاً أو وصل حد سوبابيس (rate limit)، فالباسورد صحيح — يدخل بسلام
+        if (!known && deviceId) {
+          try { await dal.del('ur_devices', { fingerprint: deviceId }) } catch (_) {}
+          await activateDevice(profile, deviceId, req.headers['user-agent'], ip)
+        }
+        const token = signToken({ sub: profile.id, role: profile.role, phone: profile.phone, dv: deviceId })
+        return json(res, 200, { ok: true, token: token, userId: profile.id, role: profile.role, mailPending: true })
       }
       throw e
     }
-    const pending = signToken({ scope: 'otp', purpose: purpose, sub: profile.id, ph: phone, em: profile.email, fp: deviceId }, 0.007)
-    return json(res, 200, Object.assign({ ok: true, needsOtp: true, pending: pending, email: profile.email, newDevice: !known }, extra))
   }
 
   // حسابات قديمة بلا بريد مفعّل (ومنها الإدارة): دخول مباشر مع تنبيه إكمال البريد
