@@ -7,9 +7,11 @@
 //  · Cloudflare Turnstile اختياري عند ضبط المفاتيح + كبح القوة الغاشمة الدائم
 //  v8.8 — سد ثغرة: حساب بريده غير مفعّل ما يدخل بلا رمز (المسار المتساهل صار فقط
 //  لمن لا بريد له إطلاقاً) + bindEmail: ربط إجباري لبريد الحسابات القديمة
-const { cors, json, readBody, dal, hashPassword, verifyPassword, signToken, getToken, verifyToken, verifyTurnstile, crypto, ENV } = require('./_lib')
+//  v9.0 — رموز OTP تصدر وتُتحقق من Supabase Auth نفسها (GoTrue عبر HTTPS صرف):
+//  لا مزود بريد خارجي ولا MAIL_* — التفعيل يكون من لوحة Supabase (Email provider)
+//  والكولداون والحد اليومي والأجهزة والجلسات تبقى كلها بقواعدنا نحن.
+const { cors, json, readBody, dal, hashPassword, verifyPassword, signToken, getToken, verifyToken, verifyTurnstile, ENV } = require('./_lib')
 const { provisionAdmin } = require('./_engine')
-const { sendOtpEmail } = require('./_mail')
 
 function normalizePhone(p) {
   if (!p) return ''
@@ -26,8 +28,6 @@ function normalizePhone(p) {
 
 const PHONE_RE = /^07[0-9]{9}$/
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/
-const OTP_TTL_MS = 10 * 60 * 1000
-const OTP_MAX_ATTEMPTS = 5
 const OTP_RESEND_COOLDOWN_MS = 60 * 1000
 const OTP_DAILY_LIMIT = 8
 
@@ -120,51 +120,49 @@ async function notifyAdmins(icon, text, orderId) {
   } catch (_) {}
 }
 
-// ------------------------------------------------------------ OTP helpers
-function genCode() { return String(crypto.randomInt(100000, 1000000)) }
-
-async function otpDailyCount(email, purpose) {
-  const rows = await dal.all('ur_email_otps', { email: email, purpose: purpose })
-  const dayAgo = Date.now() - 86400000
-  return rows.filter((r) => new Date(r.created_at).getTime() > dayAgo).length
+// ------------------------------------------------------------ OTP عبر Supabase Auth (v9.0)
+//  الرمز يولّده ويرسله GoTrue لبريد المستخدم مباشرة — لا مزود بريد ولا حزم.
+//  نحتفظ نحن بالكولداون والحد اليومي (ur_rate_limits) فوق حدود Supabase نفسها.
+async function supaOtpCall(path, payload) {
+  try {
+    const r = await fetch(ENV.SUPABASE_URL + '/auth/v1/' + path, {
+      method: 'POST',
+      headers: { 'apikey': ENV.SERVICE_KEY, 'Authorization': 'Bearer ' + ENV.SERVICE_KEY, 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    })
+    return r.ok
+  } catch (_) { return false }
 }
-async function latestOtp(email, purpose) {
-  const rows = await dal.all('ur_email_otps', { email: email, purpose: purpose })
-  return rows.sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime())[0] || null
-}
 
-// ينشئ رمزاً ويرسله؛ يرمي otp_wait / otp_limit / mail_not_configured
+// يرسل رمزاً جديداً؛ يرمي otp_wait / otp_limit / mail_failed
 async function issueOtp(email, purpose, ip) {
-  const last = await latestOtp(email, purpose)
-  if (last && !last.consumed_at && (Date.now() - new Date(last.created_at).getTime()) < OTP_RESEND_COOLDOWN_MS) {
+  const cdKey = 'otp:cd:' + purpose + ':' + email
+  const cd = await rlGet(cdKey)
+  if (cd && (Date.now() - (cd.first || 0)) < OTP_RESEND_COOLDOWN_MS) {
     const e = new Error('otp_wait'); e.code = 'otp_wait'; e.status = 429; throw e
   }
-  if (await otpDailyCount(email, purpose) >= OTP_DAILY_LIMIT) {
+  const dayKey = 'otp:day:' + email
+  const day = await rlGet(dayKey)
+  const dayCount = (day && (Date.now() - (day.first || 0)) < 86400000) ? (day.count || 0) : 0
+  if (dayCount >= OTP_DAILY_LIMIT) {
     const e = new Error('otp_limit'); e.code = 'otp_limit'; e.status = 429; throw e
   }
-  const code = genCode()
-  await dal.insert('ur_email_otps', {
-    email: email, code_hash: hashPassword(code), purpose: purpose,
-    attempts: 0, expires_at: new Date(Date.now() + OTP_TTL_MS).toISOString(),
-    consumed_at: null, created_at: new Date().toISOString(),
-  })
-  const sent = await sendOtpEmail(email, code, purpose)
+  const sent = await supaOtpCall('otp', { email: email, create_user: true })
+  if (!sent) { const e = new Error('mail_failed'); e.code = 'mail_failed'; e.status = 502; throw e }
+  await rlSet(cdKey, 1, Date.now(), [])
+  await rlSet(dayKey, dayCount + 1, dayCount ? day.first : Date.now(), [])
   await secEvent(null, 'otp_issued', { email: email, purpose: purpose }, ip)
-  return sent && sent.dev ? { devCode: code } : {}
+  return {}
 }
 
-// يتحقق من الرمز ويستهلكه؛ يرمي bad_otp / otp_locked / otp_expired
+// يتحقق من الرمز عند Supabase (أحادي الاستخدام)؛ يرمي bad_otp
+//  وعند النجاح يصفّر الكولداون حتى يكدر المستخدم يدخل فوراً من جديد إذا انغلق.
 async function consumeOtp(email, purpose, code) {
-  const row = await latestOtp(email, purpose)
-  if (!row || row.consumed_at) { const e = new Error('bad_otp'); e.code = 'bad_otp'; throw e }
-  if ((row.attempts || 0) >= OTP_MAX_ATTEMPTS) { const e = new Error('otp_locked'); e.code = 'otp_locked'; e.status = 429; throw e }
-  if (new Date(row.expires_at).getTime() < Date.now()) { const e = new Error('otp_expired'); e.code = 'otp_expired'; throw e }
-  const ok = verifyPassword(String(code || '').trim(), row.code_hash)
-  if (!ok) {
-    try { await dal.update('ur_email_otps', { id: row.id }, { attempts: (row.attempts || 0) + 1 }) } catch (_) {}
-    const e = new Error('bad_otp'); e.code = 'bad_otp'; throw e
-  }
-  await dal.update('ur_email_otps', { id: row.id }, { consumed_at: new Date().toISOString() })
+  const token = String(code || '').trim()
+  if (!/^\d{6}$/.test(token)) { const e = new Error('bad_otp'); e.code = 'bad_otp'; throw e }
+  const ok = await supaOtpCall('verify', { type: 'email', email: email, token: token })
+  if (!ok) { const e = new Error('bad_otp'); e.code = 'bad_otp'; throw e }
+  try { await rlSet('otp:cd:' + purpose + ':' + email, 0, 0, []) } catch (_) {}
   return true
 }
 
@@ -352,7 +350,7 @@ async function register(res, b, req) {
     extra = await issueOtp(email, 'register', ip)
   } catch (e) {
     if (e.code === 'mail_not_configured' || e.code === 'mail_failed') {
-      await notifyAdmins('📧', 'البريد غير مهيأ — حساب ' + name + ' (' + phone + ') ينتظر رمز التفعيل. اضبط MAIL_* بمتغيرات البيئة', null)
+      await notifyAdmins('📧', 'خدمة الرموز متعطلة — حساب ' + name + ' (' + phone + ') ينتظر رمز التفعيل. فعّل Email provider من لوحة Supabase ← Authentication', null)
       extra = { mailPending: true }
     } else throw e
   }
@@ -409,7 +407,7 @@ async function login(res, b, req) {
       extra = await issueOtp(profile.email, purpose, ip)
     } catch (e) {
       if (e.code === 'mail_not_configured' || e.code === 'mail_failed') {
-        await notifyAdmins('📧', 'البريد تعطّل — ' + profile.name + ' ما يكدر يسجّل دخول (OTP). راجع MAIL_*', null)
+        await notifyAdmins('📧', 'خدمة الرموز متعطلة — ' + profile.name + ' ما يكدر يسجّل دخول (OTP). فعّل Email provider من Supabase', null)
         return json(res, 503, { ok: false, error: 'mail_not_configured' })
       }
       throw e
@@ -459,7 +457,7 @@ async function verifyOtpAction(res, b, req) {
   const email = payload.em || profile.email
   if (!email) return json(res, 400, { ok: false, error: 'bad_pending' })
 
-  await consumeOtp(email, payload.purpose, b.code) // يرمي bad_otp / otp_locked / otp_expired
+  await consumeOtp(email, payload.purpose, b.code) // يرمي bad_otp
 
   if (payload.purpose === 'register' || payload.purpose === 'login') {
     if (payload.purpose === 'register' && !profile.email_verified) {
