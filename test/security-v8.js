@@ -1,6 +1,6 @@
 // =====================================================================
 //  مدللني — جناح اختبارات الأمان v8 (يعمل دون شبكة: قاعدة بيانات وهمية
-//  بالذاكرة + بريد بوضع التطوير). التشغيل: node security-v8.js
+//  بالذاكرة + بريد بوضع التطوير). التشغيل: node test/security-v8.js
 // =====================================================================
 'use strict'
 process.env.JWT_SECRET = 'suite-secret-key-for-tests-only'
@@ -108,7 +108,7 @@ const mockClient = {
 
 // ---------------------------------------------------------- تحميل الوحدات
 const path = require('path')
-const OUT = path.resolve(__dirname, '../api')
+const OUT = path.join(__dirname, '..', 'api')
 const lib = require(path.join(OUT, '_lib.js'))
 lib.__setClientForTest(mockClient)
 const engine = require(path.join(OUT, '_engine.js'))
@@ -225,6 +225,7 @@ async function main() {
   const custFresh = findRow('ur_profiles', 'id', cust.id)
   const co = await engine.runAction(custFresh, 'createOrder', { serviceId: 's1', area: 'الحبوبي / المركز', estimate: 15000, desc: 'تصليح عطل كهرباء بالبيت', address: 'قرب الجامعة', when: 'now', whenTime: '', payMethod: 'cash' })
   const orderId = co && co.orderId
+  t('S11+ رقم الطلب الجديد ببادئة صحيحة (UR- الحالية أو MD- القادمة)', !!orderId && (orderId.slice(0,3)==='UR-' || orderId.slice(0,3)==='MD-') && orderId.length > 4, String(orderId))
   const orderRow = findRow('ur_orders', 'id', orderId)
   t('S11 الطلب انشأ ومُعلَّم flagged', !!(orderRow && orderRow.flagged === true), JSON.stringify(co).slice(0, 100))
   t('S11 حدث collusion_flag عبر IP موثّق', rows('ur_security_events').some((e) => e.kind === 'collusion_flag' && e.meta && e.meta.via === 'ip'))
@@ -256,10 +257,10 @@ async function main() {
 
   console.log('\n[S15] Turnstile يحجب عند الفشل ويمرّر عند النجاح')
   fetchState.ok = false
-  const lt = await call(authHandler, { action: 'login', turnstileToken: 'tok', phone: '07701110001', pass: 'secret123', deviceId: 'devB', turnstileToken: 'bad' }, '9.9.9.9')
+  const lt = await call(authHandler, { action: 'login', turnstileToken: 'bad', phone: '07701110001', pass: 'secret123', deviceId: 'devB' }, '9.9.9.9')
   t('S15 توكن Turnstile فاشل → turnstile_failed', lt.j.error === 'turnstile_failed', JSON.stringify(lt.j).slice(0, 80))
   fetchState.ok = true
-  const lt2 = await call(authHandler, { action: 'login', turnstileToken: 'tok', phone: '07701110001', pass: 'secret123', deviceId: 'devB', turnstileToken: 'good' }, '9.9.9.9')
+  const lt2 = await call(authHandler, { action: 'login', turnstileToken: 'good', phone: '07701110001', pass: 'secret123', deviceId: 'devB' }, '9.9.9.9')
   t('S15 توكن ناجح يمرّ للـ OTP', lt2.j.needsOtp === true, JSON.stringify(lt2.j).slice(0, 80))
 
   console.log('\n[S16] عزل الأمان بالسنابشوت: الإدارة تشوف الكل، المستخدم يشوف أجهزته')
@@ -280,6 +281,40 @@ async function main() {
   await engine.runAction(admin, 'revokeDevice', { deviceId: devBrow.id, reason: 'اختبار' })
   const snapAfter = await call(dataHandler, { action: 'snapshot' }, '9.9.9.9', 'ua-devB', lv3.j.token)
   t('S18 revokeDevice → الجلسة الحية ماتت (401)', snapAfter.status === 401 && snapAfter.j.error === 'device_revoked', snapAfter.status + '')
+
+  console.log('\n[T19] ثغرة مسدودة: تسجيل بلا إكمال الرمز ← الدخول يطلب الرمز إجبارياً')
+  const r19 = await call(authHandler, { action: 'register', turnstileToken: 'tok', name: 'متهاون', phone: '07706660001', pass: 'secret123', email: 'lazy@test.iq', area: 'الحبوبي / المركز', deviceId: 'devL' }, '4.4.4.4')
+  t('T19 التسجيل يرجّع رمزاً', r19.j.needsOtp === true, JSON.stringify(r19.j).slice(0, 80))
+  rows('ur_email_otps').forEach((o) => { o.created_at = new Date(Date.now() - 61000).toISOString() }) // تجاوز الكولداون
+  const l19 = await call(authHandler, { action: 'login', turnstileToken: 'tok', phone: '07706660001', pass: 'secret123', deviceId: 'devL' }, '4.4.4.4')
+  t('T19 دخول حساب بريده غير مفعّل → needsOtp وليس توكن (ماكو التفاف)', l19.j.needsOtp === true && !l19.j.token, JSON.stringify(l19.j).slice(0, 100))
+  const v19 = await call(authHandler, { action: 'verifyOtp', pending: l19.j.pending, code: l19.j.devCode }, '4.4.4.4')
+  t('T19 إكمال الرمز يفعّل البريد ويصدر جلسة', !!v19.j.token && findRow('ur_profiles', 'phone', '07706660001').email_verified === true)
+
+  console.log('\n[T20–T21] ربط البريد للحسابات القديمة + حماية الربط المتقاطع')
+  rows('ur_profiles').push({ id: _id++, role: 'customer', name: 'قديم', phone: '07707770001', pass_hash: await lib.hashPassword('secret123'), area: 'الحبوبي / المركز', status: 'active', devices: [], email: null, email_verified: false, created_at: new Date().toISOString() })
+  const l20 = await call(authHandler, { action: 'login', turnstileToken: 'tok', phone: '07707770001', pass: 'secret123', deviceId: 'devOLD' }, '3.3.3.3')
+  t('T20 حساب بلا بريد إطلاقاً يدخل مباشرة + needsEmail', !!l20.j.token && l20.j.needsEmail === true, JSON.stringify(l20.j).slice(0, 100))
+  const b20 = await call(authHandler, { action: 'bindEmail', email: 'old@test.iq' }, '3.3.3.3', undefined, l20.j.token)
+  t('T20 bindEmail يرسل رمزاً', b20.j.needsOtp === true && /^\d{6}$/.test(b20.j.devCode || ''), JSON.stringify(b20.j).slice(0, 100))
+  const vb20 = await call(authHandler, { action: 'verifyOtp', pending: b20.j.pending, code: b20.j.devCode }, '3.3.3.3')
+  t('T20 الرمز يربط البريد ويفعّله', vb20.j.bound === true && findRow('ur_profiles', 'phone', '07707770001').email_verified === true)
+  const l20b = await call(authHandler, { action: 'login', turnstileToken: 'tok', phone: '07707770001', pass: 'secret123', deviceId: 'devOLD' }, '3.3.3.3')
+  t('T20 بعد الربط: الدخول صار بخطوتين إجبارياً', l20b.j.needsOtp === true && !l20b.j.token)
+  const b21 = await call(authHandler, { action: 'bindEmail', email: 'cust@test.iq' }, '3.3.3.3', undefined, l20.j.token)
+  t('T21 ربط بريد محجوز لحساب آخر → email_taken', b21.j.error === 'email_taken', JSON.stringify(b21.j).slice(0, 80))
+  const r21 = await call(authHandler, { action: 'register', turnstileToken: 'tok', name: 'متقاطع', phone: '07707770001', pass: 'secret123', email: 'fresh@test.iq', area: 'الحبوبي / المركز', deviceId: 'devNEW2' }, '2.2.2.2')
+  t('T21 تسجيل برقم مربوط → phone_taken (والعكس مُختبَر بـ S4)', r21.j.error === 'phone_taken', r21.j.error)
+
+  console.log('\n[T22] Turnstile ينفَّذ فقط بزوج المفاتيح كاملاً (لا قفل ذاتي بنصف ضبط)')
+  lib.ENV.TURNSTILE_SITE_KEY = ''
+  const tsOff = await lib.verifyTurnstile('', '1.1.1.1')
+  t('T22 سر بلا مفتاح علني = غير مفعّل', tsOff === true)
+  lib.ENV.TURNSTILE_SITE_KEY = 'ts-site-test'
+  fetchState.ok = false
+  const tsOn = await lib.verifyTurnstile('bad', '1.1.1.1')
+  t('T22 بوجود الزوج: الفشل يرفض', tsOn === false)
+  fetchState.ok = true
 
   console.log('\n========================================')
   console.log('النتيجة: ' + pass + '/' + (pass + fail) + ' ناجحة')
