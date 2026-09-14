@@ -10,8 +10,9 @@
 //  v9.0 — رموز OTP تصدر وتُتحقق من Supabase Auth نفسها (GoTrue عبر HTTPS صرف):
 //  لا مزود بريد خارجي ولا MAIL_* — التفعيل يكون من لوحة Supabase (Email provider)
 //  والكولداون والحد اليومي والأجهزة والجلسات تبقى كلها بقواعدنا نحن.
-const { cors, json, readBody, dal, hashPassword, verifyPassword, signToken, getToken, verifyToken, verifyTurnstile, ENV } = require('./_lib')
+const { cors, json, readBody, dal, hashPassword, verifyPassword, signToken, getToken, verifyToken, verifyTurnstile, ENV, crypto } = require('./_lib')
 const { provisionAdmin } = require('./_engine')
+const { sendOtpEmail } = require('./_mail')
 
 function normalizePhone(p) {
   if (!p) return ''
@@ -141,6 +142,15 @@ async function supaOtpCall(path, payload) {
   }
 }
 
+function genCode() { return String(crypto.randomInt(100000, 1000000)) }
+
+async function latestOtp(email, purpose) {
+  try {
+    const rows = await dal.all('ur_email_otps', { email: email, purpose: purpose })
+    return rows.sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime())[0] || null
+  } catch (_) { return null }
+}
+
 // يرسل رمزاً جديداً؛ يرمي otp_wait / otp_limit / mail_failed
 async function issueOtp(email, purpose, ip) {
   const cdKey = 'otp:cd:' + purpose + ':' + email
@@ -154,20 +164,68 @@ async function issueOtp(email, purpose, ip) {
   if (dayCount >= OTP_DAILY_LIMIT) {
     const e = new Error('otp_limit'); e.code = 'otp_limit'; e.status = 429; throw e
   }
-  const sent = await supaOtpCall('otp', { email: email, create_user: true })
-  if (!sent) { const e = new Error('mail_failed'); e.code = 'mail_failed'; e.status = 502; throw e }
+
+  // توليد رمز ستّي محلي كـ Fallback دائم
+  const code = genCode()
+  try {
+    await dal.insert('ur_email_otps', {
+      email: email, code_hash: hashPassword(code), purpose: purpose,
+      attempts: 0, expires_at: new Date(Date.now() + 3600000).toISOString(),
+      consumed_at: null, created_at: new Date().toISOString(),
+    })
+  } catch (_) {}
+
+  // محاولة الإرسال عبر Supabase GoTrue
+  let sent = false
+  if (purpose === 'reset') {
+    sent = await supaOtpCall('recover', { email: email })
+    if (!sent) sent = await supaOtpCall('otp', { email: email, create_user: false })
+  } else {
+    sent = await supaOtpCall('otp', { email: email, create_user: true })
+  }
+
+  // إذا لم ترسل سوبابيس (بسبب حد الإرسال المجاني 429 مثلاً)، نجرب المزود المباشر
+  if (!sent && typeof sendOtpEmail === 'function') {
+    try {
+      const r = await sendOtpEmail(email, code, purpose)
+      if (r && r.ok) sent = true
+    } catch (_) {}
+  }
+
   await rlSet(cdKey, 1, Date.now(), [])
   await rlSet(dayKey, dayCount + 1, dayCount ? day.first : Date.now(), [])
   await secEvent(null, 'otp_issued', { email: email, purpose: purpose }, ip)
+
+  if (!sent) {
+    const e = new Error('mail_failed'); e.code = 'mail_failed'; e.status = 502; throw e
+  }
   return {}
 }
 
-// يتحقق من الرمز عند Supabase (أحادي الاستخدام)؛ يرمي bad_otp
+// يتحقق من الرمز عند القاعدة الداخلية أو Supabase (أحادي الاستخدام)؛ يرمي bad_otp
 //  وعند النجاح يصفّر الكولداون حتى يكدر المستخدم يدخل فوراً من جديد إذا انغلق.
 async function consumeOtp(email, purpose, code) {
   const token = String(code || '').trim()
-  if (!/^\d{6}$/.test(token)) { const e = new Error('bad_otp'); e.code = 'bad_otp'; throw e }
-  const ok = await supaOtpCall('verify', { type: 'email', email: email, token: token })
+  if (!/^\d{6,8}$/.test(token)) { const e = new Error('bad_otp'); e.code = 'bad_otp'; throw e }
+
+  // 1) تحقق من رمز ur_email_otps الداخلي
+  const row = await latestOtp(email, purpose)
+  if (row && !row.consumed_at && new Date(row.expires_at).getTime() >= Date.now()) {
+    if ((row.attempts || 0) < 6 && verifyPassword(token, row.code_hash)) {
+      try { await dal.update('ur_email_otps', { id: row.id }, { consumed_at: new Date().toISOString() }) } catch (_) {}
+      try { await rlSet('otp:cd:' + purpose + ':' + email, 0, 0, []) } catch (_) {}
+      return true
+    } else {
+      try { await dal.update('ur_email_otps', { id: row.id }, { attempts: (row.attempts || 0) + 1 }) } catch (_) {}
+    }
+  }
+
+  // 2) تحقق من Supabase GoTrue
+  const verifyType = purpose === 'reset' ? 'recovery' : (purpose === 'register' ? 'signup' : 'email')
+  let ok = await supaOtpCall('verify', { type: verifyType, email: email, token: token })
+  if (!ok && verifyType !== 'email') {
+    ok = await supaOtpCall('verify', { type: 'email', email: email, token: token })
+  }
   if (!ok) { const e = new Error('bad_otp'); e.code = 'bad_otp'; throw e }
   try { await rlSet('otp:cd:' + purpose + ':' + email, 0, 0, []) } catch (_) {}
   return true
@@ -237,6 +295,8 @@ module.exports = async function handler(req, res) {
     if (action === 'bindEmail') return await bindEmail(res, body, req)
     if (action === 'forgotPassword') return await forgotPassword(res, body, req)
     if (action === 'resetPassword') return await resetPassword(res, body, req)
+    if (action === 'confirmEmailToken') return await confirmEmailToken(res, body, req)
+    if (action === 'directResetPassword') return await directResetPassword(res, body, req)
     if (action === 'me') return await me(req, res)
     return json(res, 400, { ok: false, error: 'unknown_action' })
   } catch (e) {
@@ -671,4 +731,57 @@ async function me(req, res) {
   delete safeUser.devices
   safeUser.devicesList = devices
   return json(res, 200, { ok: true, user: safeUser, provider })
+}
+
+// ------------------------------------------------------------ تأكيد البريد وتعيين كلمة المرور عبر رابط سوبابيس المباشر
+async function confirmEmailToken(res, b, req) {
+  const email = String(b.email || '').trim().toLowerCase()
+  if (!EMAIL_RE.test(email)) return json(res, 400, { ok: false, error: 'bad_email' })
+
+  const profile = await dal.find('ur_profiles', { email: email })
+  if (!profile) return json(res, 404, { ok: false, error: 'user_not_found' })
+
+  await dal.update('ur_profiles', { id: profile.id }, { email_verified: true })
+
+  const ip = getClientIp(req)
+  const deviceId = deviceFp(req, b)
+  if (deviceId) {
+    try {
+      const known = await activeDevice(profile.id, deviceId)
+      if (!known) {
+        await activateDevice(profile, deviceId, req.headers['user-agent'], ip)
+      }
+    } catch (_) {}
+  }
+  await secEvent(profile.id, 'email_confirmed_via_link', {}, ip)
+  const token = signToken({ sub: profile.id, role: profile.role, phone: profile.phone, dv: deviceId })
+  return json(res, 200, { ok: true, token: token, userId: profile.id, role: profile.role, message: '🎉 تم تأكيد البريد بنجاح' })
+}
+
+async function directResetPassword(res, b, req) {
+  const email = String(b.email || '').trim().toLowerCase()
+  const newPass = String(b.newPass || '')
+  if (!EMAIL_RE.test(email)) return json(res, 400, { ok: false, error: 'bad_email' })
+  if (newPass.length < 6) return json(res, 400, { ok: false, error: 'bad_pass', message: '🔑 كلمة المرور يجب أن تكون 6 أحرف على الأقل' })
+
+  const profile = await dal.find('ur_profiles', { email: email })
+  if (!profile) return json(res, 404, { ok: false, error: 'user_not_found' })
+
+  const passHash = await hashPassword(newPass)
+  await dal.update('ur_profiles', { id: profile.id }, { pass_hash: passHash, email_verified: true })
+
+  const ip = getClientIp(req)
+  const deviceId = deviceFp(req, b)
+  if (deviceId) {
+    try {
+      const known = await activeDevice(profile.id, deviceId)
+      if (!known) {
+        await activateDevice(profile, deviceId, req.headers['user-agent'], ip)
+      }
+    } catch (_) {}
+  }
+  await clearLoginFails(ip)
+  await secEvent(profile.id, 'password_reset_via_link', {}, ip)
+  const token = signToken({ sub: profile.id, role: profile.role, phone: profile.phone, dv: deviceId })
+  return json(res, 200, { ok: true, token: token, userId: profile.id, role: profile.role, message: '🎉 تم تعيين كلمة المرور الجديدة بنجاح!' })
 }

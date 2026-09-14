@@ -81,7 +81,7 @@ window.openForgotPasswordModal = function(){
   var curPhone = $('lgPhone') ? normalizePhone($('lgPhone').value) : '';
   openModal('🔑 استعادة كلمة المرور',
     '<p style="font-size:14px;color:var(--muted);line-height:1.9">أدخل رقم هاتفك المسجل وسنرسل رمز تأكيد مكون من 6 أرقام إلى بريدك الإلكتروني لتعيين كلمة مرور جديدة.</p>'
-    +'<div class="field"><label>📱 رقم الهاتف</label><input id="fpPhone" type="tel" dir="ltr" placeholder="07xxxxxxxx" value="'+esc(curPhone)+'"></div>',
+    +'<div class="field"><label>📱 رقم الهاتف</label><input id="fpPhone" type="tel" dir="ltr" placeholder="07xxxxxxxx" value="'+esc88(curPhone)+'"></div>',
     '📧 إرسال رمز التحقق', function(){ window.sendForgotPassword(); });
   setTimeout(function(){ var i=$('fpPhone'); if(i) i.focus(); }, 180);
 };
@@ -107,7 +107,7 @@ window.openResetPasswordStep = function(pending, maskedEmail, phone){
   window._resetState = { pending:pending, email:maskedEmail, phone:phone };
   openModal('🔑 تعيين كلمة المرور الجديدة',
     '<div style="text-align:center;margin-bottom:8px"><span style="font-size:36px">🔐</span></div>'
-    +'<p style="font-size:14px;color:var(--muted);text-align:center;line-height:1.9">أرسلنا رمزاً من 6 أرقام إلى بريدك:<br><b style="direction:ltr;display:inline-block">'+esc(maskedEmail)+'</b></p>'
+    +'<p style="font-size:14px;color:var(--muted);text-align:center;line-height:1.9">أرسلنا رمزاً من 6 أرقام إلى بريدك:<br><b style="direction:ltr;display:inline-block">'+esc88(maskedEmail)+'</b></p>'
     +'<div class="field"><label>📧 رمز التحقق الستّي</label><input id="rpOtpCode" inputmode="numeric" maxlength="6" placeholder="••••••" style="text-align:center;font-size:24px;font-weight:900;letter-spacing:10px;direction:ltr"></div>'
     +'<div class="field"><label>🔒 كلمة المرور الجديدة</label><input id="rpNewPass" type="password" placeholder="6 أحرف أو أرقام فأكثر"></div>'
     +'<div class="field"><label>🔒 تأكيد كلمة المرور الجديدة</label><input id="rpNewPass2" type="password" placeholder="أعد كتابة كلمة المرور"></div>',
@@ -164,7 +164,7 @@ window.openOtpStep = function(pending, email, purpose){
   var purposeTxt = purpose==='register'?'تفعيل حسابك':purpose==='device'?'تأكيد جهازك الجديد':purpose==='bind'?'ربط بريدك':'دخولك';
   openModal('📧 رمز التحقق من بريدك',
     '<div style="text-align:center;margin-bottom:10px"><span style="font-size:38px">📧</span></div>'
-    +'<p style="font-size:14px;color:var(--muted);text-align:center;line-height:1.9">أرسلنا رمزاً من 6 أرقام إلى<br><b style="direction:ltr;display:inline-block">'+esc(email)+'</b><br>اكتبه هنا حتى نكمل '+purposeTxt+' — صالح لساعة ويُستخدم مرة وحدة.</p>'
+    +'<p style="font-size:14px;color:var(--muted);text-align:center;line-height:1.9">أرسلنا رمزاً من 6 أرقام إلى<br><b style="direction:ltr;display:inline-block">'+esc88(email)+'</b><br>اكتبه هنا حتى نكمل '+purposeTxt+' — صالح لساعة ويُستخدم مرة وحدة.</p>'
     +'<div class="field"><input id="otpCode" inputmode="numeric" maxlength="6" placeholder="••••••" style="text-align:center;font-size:26px;font-weight:900;letter-spacing:12px;direction:ltr"></div>'
     +'<div style="display:flex;justify-content:space-between;align-items:center;margin-top:4px"><button class="btn btn-ghost btn-sm" onclick="resendOtpCode()">↺ إعادة الإرسال</button><span style="font-size:12px;color:var(--faint)">ما وصلك؟ راجع السبام</span></div>',
     '✓ تأكيد', function(){ window.verifyOtpCode(); });
@@ -256,6 +256,98 @@ try{
     for (var i = 0; i < muts.length; i++){ if (muts[i].addedNodes && muts[i].addedNodes.length){ scheduleInject88(); return; } }
   }).observe(document.body, { childList: true, subtree: true });
 }catch(e){}
+/* ---- 6) معالجة روابط التأكيد واستعادة كلمة المرور القادمة من سوبابيس ---- */
+window.openDirectResetModal = function(email, accessToken){
+  openModal('🔑 تعيين كلمة المرور الجديدة',
+    '<div style="text-align:center;margin-bottom:8px"><span style="font-size:36px">🔐</span></div>'
+    +'<p style="font-size:14px;color:var(--muted);text-align:center;line-height:1.9">تم تأكيد طلبك بنجاح للبريد:<br><b style="direction:ltr;display:inline-block">'+esc88(email)+'</b><br>اكتب كلمة المرور الجديدة لحسابك:</p>'
+    +'<div class="field"><label>🔒 كلمة المرور الجديدة</label><input id="drNewPass" type="password" placeholder="6 أحرف أو أرقام فأكثر"></div>'
+    +'<div class="field"><label>🔒 تأكيد كلمة المرور الجديدة</label><input id="drNewPass2" type="password" placeholder="أعد كتابة كلمة المرور"></div>',
+    '✓ حفظ وتغيير كلمة المرور', function(){
+      var p1 = $('drNewPass') ? $('drNewPass').value : '';
+      var p2 = $('drNewPass2') ? $('drNewPass2').value : '';
+      if(p1.length < 6){ toast('🔑 كلمة المرور يجب أن تكون 6 أحرف على الأقل'); return; }
+      if(p1 !== p2){ toast('⚠️ كلمتا المرور غير متطابقتين'); return; }
+      apiCall('auth', { action:'directResetPassword', email:email, newPass:p1, accessToken:accessToken, deviceId:deviceFp88() }).then(function(j){
+        closeModal();
+        if(j && j.token){
+          setToken(j.token);
+          return refresh().then(function(){
+            toast('🎉 تم تعيين كلمة المرور الجديدة وتسجيل دخولك بنجاح!');
+            go(j.role === 'admin' ? '#/admin' : '#/home');
+          });
+        } else {
+          toast('✅ تم تعيين كلمة المرور بنجاح — يمكنك الآن تسجيل الدخول');
+          go('#/auth/login');
+        }
+      }).catch(function(e){ toast(errMsg88(e&&e.code)); });
+    });
+  setTimeout(function(){ var i=$('drNewPass'); if(i) i.focus(); }, 180);
+};
+
+function handleSupabaseRedirect(){
+  try{
+    var hash = location.hash || '';
+    var search = location.search || '';
+    if(hash.indexOf('access_token=') >= 0 || hash.indexOf('type=recovery') >= 0 || hash.indexOf('type=signup') >= 0){
+      var params = {};
+      var raw = hash.replace(/^#/, '');
+      raw.split('&').forEach(function(part){
+        var kv = part.split('=');
+        if(kv.length === 2) params[decodeURIComponent(kv[0])] = decodeURIComponent(kv[1]);
+      });
+
+      var accessToken = params['access_token'];
+      var type = params['type'] || 'signup';
+      var errorDesc = params['error_description'];
+
+      if(errorDesc){
+        toast('⚠️ ' + decodeURIComponent(errorDesc.replace(/\+/g, ' ')));
+        window.history.replaceState(null, '', location.pathname + '#/home');
+        return;
+      }
+
+      if(type === 'recovery'){
+        window.history.replaceState(null, '', location.pathname + '#/auth/login');
+        if(accessToken){
+          fetch((window._supaUrl || 'https://ypotdnodfpepwstqqfwp.supabase.co') + '/auth/v1/user', {
+            headers: { 'Authorization': 'Bearer ' + accessToken, 'apikey': (window._supaAnon || 'sb_publishable_l7XdypBx04Dl9fX-ubputg_xfOg0Mi0') }
+          }).then(function(r){ return r.json(); }).then(function(u){
+            if(u && u.email){
+              window.openDirectResetModal(u.email, accessToken);
+            } else {
+              window.openForgotPasswordModal();
+            }
+          }).catch(function(){ window.openForgotPasswordModal(); });
+        }
+        return;
+      }
+
+      if(type === 'signup' || type === 'magiclink' || type === 'email_change' || accessToken){
+        window.history.replaceState(null, '', location.pathname + '#/home');
+        fetch((window._supaUrl || 'https://ypotdnodfpepwstqqfwp.supabase.co') + '/auth/v1/user', {
+          headers: { 'Authorization': 'Bearer ' + accessToken, 'apikey': (window._supaAnon || 'sb_publishable_l7XdypBx04Dl9fX-ubputg_xfOg0Mi0') }
+        }).then(function(r){ return r.json(); }).then(function(u){
+          if(u && u.email){
+            apiCall('auth', { action: 'confirmEmailToken', email: u.email, deviceId: deviceFp88() }).then(function(j){
+              if(j && j.token){
+                setToken(j.token);
+                refresh().then(function(){
+                  toast('🎉 تم تأكيد بريدك الإلكتروني بنجاح — أهلاً بك في مدللني!');
+                  go('#/home');
+                });
+              }
+            });
+          }
+        });
+      }
+    }
+  }catch(e){ console.error('Error handling Supabase redirect:', e); }
+}
+
+window.addEventListener('hashchange', handleSupabaseRedirect);
+handleSupabaseRedirect();
 injectAuthFields();
 
 })();
+
