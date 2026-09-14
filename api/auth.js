@@ -130,8 +130,15 @@ async function supaOtpCall(path, payload) {
       headers: { 'apikey': ENV.SERVICE_KEY, 'Authorization': 'Bearer ' + ENV.SERVICE_KEY, 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
     })
+    if (!r.ok) {
+      const errText = (typeof r.text === 'function') ? await r.text().catch(() => '') : ''
+      console.error('[supaOtpCall error]', path, r.status, errText)
+    }
     return r.ok
-  } catch (_) { return false }
+  } catch (err) {
+    console.error('[supaOtpCall exception]', path, err.message)
+    return false
+  }
 }
 
 // يرسل رمزاً جديداً؛ يرمي otp_wait / otp_limit / mail_failed
