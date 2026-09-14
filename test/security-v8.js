@@ -1,18 +1,31 @@
 // =====================================================================
-//  مدللني — جناح اختبارات الأمان v8 (يعمل دون شبكة: قاعدة بيانات وهمية
-//  بالذاكرة + بريد بوضع التطوير). التشغيل: node test/security-v8.js
+//  مدللني — جناح اختبارات الأمان v8/v9 (يعمل دون شبكة: قاعدة بيانات وهمية
+//  بالذاكرة + مضاهاة GoTrue لرموز OTP). التشغيل: node test/security-v8.js
 // =====================================================================
 'use strict'
 process.env.JWT_SECRET = 'suite-secret-key-for-tests-only'
-process.env.MAIL_DEV_ECHO = '1'
 process.env.TURNSTILE_SECRET = 'ts-secret-test'
 process.env.TURNSTILE_SITE_KEY = 'ts-site-test'
 process.env.ADMIN_PHONE = '07800000000'
 process.env.ADMIN_PASSWORD = 'admin-pass-123'
 
-// Turnstile siteverify مُزيّف — نتحكم بنتيجته من الاختبارات
+// Turnstile siteverify مُزيّف + مضاهاة GoTrue — نتحكم بالنتائج من الاختبارات
 const fetchState = { ok: true, calls: 0 }
+const supaOtp = {} // v9.0 — الرموز تولّد وتُخزّن هنا كأنها من Supabase
+const codeOf = (email) => supaOtp[email]
 global.fetch = async (url, opts) => {
+  const u = String(url || '')
+  if (u.indexOf('/auth/v1/otp') >= 0) {
+    const b = JSON.parse(opts.body)
+    supaOtp[b.email] = String(100000 + ((fetchState.calls * 7) % 900000))
+    fetchState.calls++
+    return { ok: true, status: 200, json: async () => ({}) }
+  }
+  if (u.indexOf('/auth/v1/verify') >= 0) {
+    const b = JSON.parse(opts.body)
+    const good = !!supaOtp[b.email] && supaOtp[b.email] === b.token
+    return { ok: good, status: good ? 200 : 403, json: async () => (good ? { ok: true } : { error_code: 'otp_invalid' }) }
+  }
   fetchState.calls++
   return { ok: true, json: async () => ({ success: fetchState.ok }) }
 }
@@ -148,7 +161,7 @@ function seed() {
 async function regAndVerify(phone, email, device, ip, role) {
   const r = await call(authHandler, { action: 'register', turnstileToken: 'tok', name: 'مستخدم ' + phone.slice(-4), phone, pass: 'secret123', email, area: 'الحبوبي / المركز', deviceId: device, role: role || 'customer', serviceIds: role === 'provider' ? ['s1'] : undefined, exp: 5, areas: ['الحبوبي / المركز'] }, ip, 'ua-' + device)
   if (!r.j.needsOtp) return { err: 'register: ' + JSON.stringify(r.j) }
-  const v = await call(authHandler, { action: 'verifyOtp', pending: r.j.pending, code: r.j.devCode }, ip, 'ua-' + device)
+  const v = await call(authHandler, { action: 'verifyOtp', pending: r.j.pending, code: codeOf(email) }, ip, 'ua-' + device)
   return { reg: r.j, ver: v.j, profile: findRow('ur_profiles', 'phone', phone) }
 }
 
@@ -157,20 +170,19 @@ async function main() {
   seed()
   console.log('\n[S1–S3] تسجيل بخطوتين + قفل الرمز + تفعيل')
   const r1 = await call(authHandler, { action: 'register', turnstileToken: 'tok', name: 'زبون أول', phone: '07701110001', pass: 'secret123', email: 'cust@test.iq', area: 'الحبوبي / المركز', deviceId: 'devA' }, '9.9.9.9')
-  t('S1 التسجيل يرجّع needsOtp ورمز تطوير 6 أرقام بلا جلسة', r1.j.needsOtp === true && /^\d{6}$/.test(r1.j.devCode || '') && !r1.j.token, JSON.stringify(r1.j).slice(0, 120))
+  t('S1 التسجيل يرجّع needsOtp ورمز 6 أرقام من Supabase بلا جلسة', r1.j.needsOtp === true && /^\d{6}$/.test(codeOf('cust@test.iq') || '') && !r1.j.token, JSON.stringify(r1.j).slice(0, 120))
   for (let i = 0; i < 5; i++) {
     const w = await call(authHandler, { action: 'verifyOtp', pending: r1.j.pending, code: '000000' }, '9.9.9.9')
-    if (i < 4 && w.j.error !== 'bad_otp') t('S2 محاولة ' + (i + 1) + ' bad_otp', false, w.j.error)
-    if (i === 4) t('S2 خامس خطأ bad_otp', w.j.error === 'bad_otp', w.j.error)
+    t('S2 محاولة خاطئة ' + (i + 1) + ' مرفوضة', w.j.error === 'bad_otp', w.j.error)
   }
   const w6 = await call(authHandler, { action: 'verifyOtp', pending: r1.j.pending, code: '000000' }, '9.9.9.9')
-  t('S2 سادس محاولة → otp_locked', w6.j.error === 'otp_locked', w6.j.error)
+  t('S2 كل المحاولات الخاطئة مرفوضة (قفل التخمين صار مسؤولية Supabase نفسها)', w6.j.error === 'bad_otp', w6.j.error)
   // رمز جديد (إعادة إرسال) ثم تحقق صحيح
   await new Promise((r) => setTimeout(r, 5))
-  rows('ur_email_otps').forEach((o) => { o.created_at = new Date(Date.now() - 61000).toISOString() }) // تجاوز الكولداون
+  rows('ur_rate_limits').forEach((r) => { if (String(r.key).indexOf('otp:cd:') === 0) r.first = 0 }) // تجاوز الكولداون (v9.0: صار بـ rate_limits)
   const rs = await call(authHandler, { action: 'resendOtp', pending: r1.j.pending }, '9.9.9.9')
-  t('S3 إعادة الإرسال ترجع رمزاً جديداً', rs.j.ok === true && /^\d{6}$/.test(rs.j.devCode || ''), JSON.stringify(rs.j).slice(0, 100))
-  const v1 = await call(authHandler, { action: 'verifyOtp', pending: rs.j.pending, code: rs.j.devCode }, '9.9.9.9')
+  t('S3 إعادة الإرسال تولّد رمزاً جديداً', rs.j.ok === true && /^\d{6}$/.test(codeOf('cust@test.iq') || ''), JSON.stringify(rs.j).slice(0, 100))
+  const v1 = await call(authHandler, { action: 'verifyOtp', pending: rs.j.pending, code: codeOf('cust@test.iq') }, '9.9.9.9')
   t('S3 الرمز الصحيح يُصدر جلسة + بريد مفعّل', !!v1.j.token && findRow('ur_profiles', 'phone', '07701110001').email_verified === true, JSON.stringify(v1.j).slice(0, 100))
   const devRowA = rows('ur_devices').find((d) => d.fingerprint === 'devA')
   t('S3 جهاز devA فعّال والجلسة تحمل بصمته', devRowA && devRowA.status === 'active' && lib.verifyToken(v1.j.token).dv === 'devA')
@@ -187,11 +199,11 @@ async function main() {
   console.log('\n[S6–S9] دخول بخطوتين + جهاز جديد ينتظر الإدارة + إلغاء يقتل الجلسة')
   const l1 = await call(authHandler, { action: 'login', turnstileToken: 'tok', phone: '07701110001', pass: 'secret123', deviceId: 'devA' }, '9.9.9.9')
   t('S6 دخول من جهاز معروف → needsOtp (login)', l1.j.needsOtp === true && l1.j.newDevice === false, JSON.stringify(l1.j).slice(0, 100))
-  const lv = await call(authHandler, { action: 'verifyOtp', pending: l1.j.pending, code: l1.j.devCode }, '9.9.9.9')
+  const lv = await call(authHandler, { action: 'verifyOtp', pending: l1.j.pending, code: codeOf('cust@test.iq') }, '9.9.9.9')
   t('S6 رمز الدخول يُصدر جلسة', !!lv.j.token)
   const l2 = await call(authHandler, { action: 'login', turnstileToken: 'tok', phone: '07701110001', pass: 'secret123', deviceId: 'devB' }, '9.9.9.9')
   t('S7 جهاز جديد → needsOtp بغرض device', l2.j.needsOtp === true && l2.j.newDevice === true, JSON.stringify(l2.j).slice(0, 100))
-  const lv2 = await call(authHandler, { action: 'verifyOtp', pending: l2.j.pending, code: l2.j.devCode }, '9.9.9.9')
+  const lv2 = await call(authHandler, { action: 'verifyOtp', pending: l2.j.pending, code: codeOf('cust@test.iq') }, '9.9.9.9')
   t('S7 بعد الرمز → needsDeviceApproval وجهاز pending', lv2.j.needsDeviceApproval === true && rows('ur_devices').some((d) => d.fingerprint === 'devB' && d.status === 'pending'), JSON.stringify(lv2.j).slice(0, 120))
   const admin = findRow('ur_profiles', 'phone', '07800000000')
   t('S7 الإدارة انبّهت بطلب الجهاز', rows('ur_notifications').some((n) => n.user_id === admin.id && String(n.body).indexOf('تبديل جهاز') >= 0))
@@ -206,7 +218,7 @@ async function main() {
   const snapOld = await call(dataHandler, { action: 'snapshot' }, '9.9.9.9', 'ua-devA', v1.j.token) // توكن قديم dv=devA
   t('S9 توكن الجهاز الملغى → 401 device_revoked', snapOld.status === 401 && snapOld.j.error === 'device_revoked', snapOld.status + ' ' + JSON.stringify(snapOld.j).slice(0, 80))
   const l3 = await call(authHandler, { action: 'login', turnstileToken: 'tok', phone: '07701110001', pass: 'secret123', deviceId: 'devB' }, '9.9.9.9')
-  const lv3 = await call(authHandler, { action: 'verifyOtp', pending: l3.j.pending, code: l3.j.devCode }, '9.9.9.9')
+  const lv3 = await call(authHandler, { action: 'verifyOtp', pending: l3.j.pending, code: codeOf('cust@test.iq') }, '9.9.9.9')
   const snapNew = await call(dataHandler, { action: 'snapshot' }, '9.9.9.9', 'ua-devB', lv3.j.token)
   t('S9 الجهاز المعتمد الجديد يمر (snapshot 200)', snapNew.status === 200 && snapNew.j.ok === true)
 
@@ -225,7 +237,7 @@ async function main() {
   const custFresh = findRow('ur_profiles', 'id', cust.id)
   const co = await engine.runAction(custFresh, 'createOrder', { serviceId: 's1', area: 'الحبوبي / المركز', estimate: 15000, desc: 'تصليح عطل كهرباء بالبيت', address: 'قرب الجامعة', when: 'now', whenTime: '', payMethod: 'cash' })
   const orderId = co && co.orderId
-  t('S11+ رقم الطلب الجديد ببادئة صحيحة (UR- الحالية أو MD- القادمة)', !!orderId && (orderId.slice(0,3)==='UR-' || orderId.slice(0,3)==='MD-') && orderId.length > 4, String(orderId))
+  t('S11+ رقم الطلب الجديد ببادئة MD- (مدللني)', !!orderId && orderId.slice(0,3)==='MD-' && orderId.length>4, String(orderId))
   const orderRow = findRow('ur_orders', 'id', orderId)
   t('S11 الطلب انشأ ومُعلَّم flagged', !!(orderRow && orderRow.flagged === true), JSON.stringify(co).slice(0, 100))
   t('S11 حدث collusion_flag عبر IP موثّق', rows('ur_security_events').some((e) => e.kind === 'collusion_flag' && e.meta && e.meta.via === 'ip'))
@@ -257,10 +269,10 @@ async function main() {
 
   console.log('\n[S15] Turnstile يحجب عند الفشل ويمرّر عند النجاح')
   fetchState.ok = false
-  const lt = await call(authHandler, { action: 'login', turnstileToken: 'bad', phone: '07701110001', pass: 'secret123', deviceId: 'devB' }, '9.9.9.9')
+  const lt = await call(authHandler, { action: 'login', phone: '07701110001', pass: 'secret123', deviceId: 'devB', turnstileToken: 'bad' }, '9.9.9.9')
   t('S15 توكن Turnstile فاشل → turnstile_failed', lt.j.error === 'turnstile_failed', JSON.stringify(lt.j).slice(0, 80))
   fetchState.ok = true
-  const lt2 = await call(authHandler, { action: 'login', turnstileToken: 'good', phone: '07701110001', pass: 'secret123', deviceId: 'devB' }, '9.9.9.9')
+  const lt2 = await call(authHandler, { action: 'login', phone: '07701110001', pass: 'secret123', deviceId: 'devB', turnstileToken: 'good' }, '9.9.9.9')
   t('S15 توكن ناجح يمرّ للـ OTP', lt2.j.needsOtp === true, JSON.stringify(lt2.j).slice(0, 80))
 
   console.log('\n[S16] عزل الأمان بالسنابشوت: الإدارة تشوف الكل، المستخدم يشوف أجهزته')
@@ -282,13 +294,14 @@ async function main() {
   const snapAfter = await call(dataHandler, { action: 'snapshot' }, '9.9.9.9', 'ua-devB', lv3.j.token)
   t('S18 revokeDevice → الجلسة الحية ماتت (401)', snapAfter.status === 401 && snapAfter.j.error === 'device_revoked', snapAfter.status + '')
 
+  console.log('\n========================================')
   console.log('\n[T19] ثغرة مسدودة: تسجيل بلا إكمال الرمز ← الدخول يطلب الرمز إجبارياً')
   const r19 = await call(authHandler, { action: 'register', turnstileToken: 'tok', name: 'متهاون', phone: '07706660001', pass: 'secret123', email: 'lazy@test.iq', area: 'الحبوبي / المركز', deviceId: 'devL' }, '4.4.4.4')
   t('T19 التسجيل يرجّع رمزاً', r19.j.needsOtp === true, JSON.stringify(r19.j).slice(0, 80))
-  rows('ur_email_otps').forEach((o) => { o.created_at = new Date(Date.now() - 61000).toISOString() }) // تجاوز الكولداون
+  rows('ur_rate_limits').forEach((r) => { if (String(r.key).indexOf('otp:cd:') === 0) r.first = 0 }) // تجاوز الكولداون (v9.0: صار بـ rate_limits)
   const l19 = await call(authHandler, { action: 'login', turnstileToken: 'tok', phone: '07706660001', pass: 'secret123', deviceId: 'devL' }, '4.4.4.4')
   t('T19 دخول حساب بريده غير مفعّل → needsOtp وليس توكن (ماكو التفاف)', l19.j.needsOtp === true && !l19.j.token, JSON.stringify(l19.j).slice(0, 100))
-  const v19 = await call(authHandler, { action: 'verifyOtp', pending: l19.j.pending, code: l19.j.devCode }, '4.4.4.4')
+  const v19 = await call(authHandler, { action: 'verifyOtp', pending: l19.j.pending, code: codeOf('lazy@test.iq') }, '4.4.4.4')
   t('T19 إكمال الرمز يفعّل البريد ويصدر جلسة', !!v19.j.token && findRow('ur_profiles', 'phone', '07706660001').email_verified === true)
 
   console.log('\n[T20–T21] ربط البريد للحسابات القديمة + حماية الربط المتقاطع')
@@ -296,8 +309,8 @@ async function main() {
   const l20 = await call(authHandler, { action: 'login', turnstileToken: 'tok', phone: '07707770001', pass: 'secret123', deviceId: 'devOLD' }, '3.3.3.3')
   t('T20 حساب بلا بريد إطلاقاً يدخل مباشرة + needsEmail', !!l20.j.token && l20.j.needsEmail === true, JSON.stringify(l20.j).slice(0, 100))
   const b20 = await call(authHandler, { action: 'bindEmail', email: 'old@test.iq' }, '3.3.3.3', undefined, l20.j.token)
-  t('T20 bindEmail يرسل رمزاً', b20.j.needsOtp === true && /^\d{6}$/.test(b20.j.devCode || ''), JSON.stringify(b20.j).slice(0, 100))
-  const vb20 = await call(authHandler, { action: 'verifyOtp', pending: b20.j.pending, code: b20.j.devCode }, '3.3.3.3')
+  t('T20 bindEmail يرسل رمزاً', b20.j.needsOtp === true && /^\d{6}$/.test(codeOf('old@test.iq') || ''), JSON.stringify(b20.j).slice(0, 100))
+  const vb20 = await call(authHandler, { action: 'verifyOtp', pending: b20.j.pending, code: codeOf('old@test.iq') }, '3.3.3.3')
   t('T20 الرمز يربط البريد ويفعّله', vb20.j.bound === true && findRow('ur_profiles', 'phone', '07707770001').email_verified === true)
   const l20b = await call(authHandler, { action: 'login', turnstileToken: 'tok', phone: '07707770001', pass: 'secret123', deviceId: 'devOLD' }, '3.3.3.3')
   t('T20 بعد الربط: الدخول صار بخطوتين إجبارياً', l20b.j.needsOtp === true && !l20b.j.token)
@@ -316,7 +329,6 @@ async function main() {
   t('T22 بوجود الزوج: الفشل يرفض', tsOn === false)
   fetchState.ok = true
 
-  console.log('\n========================================')
   console.log('النتيجة: ' + pass + '/' + (pass + fail) + ' ناجحة')
   if (failures.length) { console.log('الفاشلة:'); failures.forEach((f) => console.log('  ✗ ' + f)) }
   process.exit(fail ? 1 : 0)
