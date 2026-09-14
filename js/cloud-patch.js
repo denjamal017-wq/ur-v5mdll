@@ -43,8 +43,75 @@ function injectAuthFields(){
     if(rp && !$('rgEmail') && rp.closest('.field')) rp.closest('.field').insertAdjacentHTML('afterend','<div class="field"><label>📧 البريد الإلكتروني (يوصلك عليه رمز التحقق — حماية ثانية لحسابك)</label><input id="rgEmail" type="email" dir="ltr" placeholder="name@gmail.com" autocomplete="email"></div>');
     var lp=$('lgPass');
     if(lp && !$('lgLoginHint') && lp.closest('.field')) lp.closest('.field').insertAdjacentHTML('beforebegin','<div id="lgLoginHint" class="hint" style="font-size:12.5px;color:var(--faint);margin:-6px 0 14px;line-height:1.8">🔐 الدخول برقمك وكلمة المرور — وبعدها يوصلك رمز تأكيد على بريدك</div>');
+    if(lp && !$('lgForgotLink') && lp.closest('.field')) lp.closest('.field').insertAdjacentHTML('afterend','<div id="lgForgotLink" style="text-align:left;margin:-6px 0 14px"><a href="javascript:void(0)" onclick="openForgotPasswordModal()" style="font-size:13px;color:var(--accent);text-decoration:none;font-weight:600">🔑 نسيت كلمة المرور؟</a></div>');
   }catch(e){}
 }
+
+/* ---- 1.5) نسيت كلمة المرور وإعادة التعيين بالرمز ---- */
+window.openForgotPasswordModal = function(){
+  var curPhone = $('lgPhone') ? normalizePhone($('lgPhone').value) : '';
+  openModal('🔑 استعادة كلمة المرور',
+    '<p style="font-size:14px;color:var(--muted);line-height:1.9">أدخل رقم هاتفك المسجل وسنرسل رمز تأكيد مكون من 6 أرقام إلى بريدك الإلكتروني لتعيين كلمة مرور جديدة.</p>'
+    +'<div class="field"><label>📱 رقم الهاتف</label><input id="fpPhone" type="tel" dir="ltr" placeholder="07xxxxxxxx" value="'+esc(curPhone)+'"></div>',
+    '📧 إرسال رمز التحقق', function(){ window.sendForgotPassword(); });
+  setTimeout(function(){ var i=$('fpPhone'); if(i) i.focus(); }, 180);
+};
+
+window.sendForgotPassword = function(){
+  var rawPhone = $('fpPhone') ? $('fpPhone').value : '';
+  var phone = normalizePhone(rawPhone);
+  if(!validPhone(phone)){ toast('📱 يرجى إدخال رقم هاتف صحيح يبدأ بـ 07'); return; }
+  apiCall('auth', { action:'forgotPassword', phone:phone, deviceId: deviceFp88(), turnstileToken: tsToken88() }).then(function(j){
+    if(j && j.needsOtp){
+      window.openResetPasswordStep(j.pending, j.email || '', phone);
+    }
+  }).catch(function(e){
+    var c = e && e.code;
+    if(c === 'not_registered'){ toast('⚠️ هذا الرقم غير مسجّل لدينا'); }
+    else if(c === 'no_email'){ toast('⚠️ هذا الحساب غير مربوط ببريد — تواصل مع الإدارة للمساعدة'); }
+    else if(c === 'otp_wait'){ toast(ERR88.otp_wait); }
+    else { toast(errMsg88(c)); }
+  });
+};
+
+window.openResetPasswordStep = function(pending, maskedEmail, phone){
+  window._resetState = { pending:pending, email:maskedEmail, phone:phone };
+  openModal('🔑 تعيين كلمة المرور الجديدة',
+    '<div style="text-align:center;margin-bottom:8px"><span style="font-size:36px">🔐</span></div>'
+    +'<p style="font-size:14px;color:var(--muted);text-align:center;line-height:1.9">أرسلنا رمزاً من 6 أرقام إلى بريدك:<br><b style="direction:ltr;display:inline-block">'+esc(maskedEmail)+'</b></p>'
+    +'<div class="field"><label>📧 رمز التحقق الستّي</label><input id="rpOtpCode" inputmode="numeric" maxlength="6" placeholder="••••••" style="text-align:center;font-size:24px;font-weight:900;letter-spacing:10px;direction:ltr"></div>'
+    +'<div class="field"><label>🔒 كلمة المرور الجديدة</label><input id="rpNewPass" type="password" placeholder="6 أحرف أو أرقام فأكثر"></div>'
+    +'<div class="field"><label>🔒 تأكيد كلمة المرور الجديدة</label><input id="rpNewPass2" type="password" placeholder="أعد كتابة كلمة المرور"></div>',
+    '✓ حفظ وتغيير كلمة المرور', function(){ window.submitResetPassword(); });
+  setTimeout(function(){ var i=$('rpOtpCode'); if(i) i.focus(); }, 180);
+};
+
+window.submitResetPassword = function(){
+  var st = window._resetState || {};
+  var code = ($('rpOtpCode') ? $('rpOtpCode').value : '').trim();
+  var p1 = $('rpNewPass') ? $('rpNewPass').value : '';
+  var p2 = $('rpNewPass2') ? $('rpNewPass2').value : '';
+  if(!/^\d{6}$/.test(code)){ toast('📧 أدخل رمز التحقق المكون من 6 أرقام'); return; }
+  if(p1.length < 6){ toast('🔑 كلمة المرور يجب أن تكون 6 أحرف على الأقل'); return; }
+  if(p1 !== p2){ toast('⚠️ كلمتا المرور غير متطابقتين'); return; }
+
+  apiCall('auth', { action:'resetPassword', pending:st.pending, code:code, newPass:p1, deviceId: deviceFp88() }).then(function(j){
+    closeModal();
+    if(j && j.token){
+      setToken(j.token);
+      return refresh().then(function(){
+        toast('🎉 تم تعيين كلمة المرور الجديدة وتسجيل دخولك بنجاح!');
+        go(j.role === 'admin' ? '#/admin' : '#/home');
+      });
+    } else {
+      toast('✅ تم تعيين كلمة المرور بنجاح — يمكنك الآن تسجيل الدخول بها');
+    }
+  }).catch(function(e){
+    var c = e && e.code;
+    if(c === 'bad_otp' || c === 'otp_expired'){ toast('❌ رمز التحقق غير صحيح أو انتهت صلاحيته'); }
+    else { toast(errMsg88(c)); }
+  });
+};
 
 /* ---- 2) ربط البريد للحسابات القديمة (يظهر بكل دخول حتى يتم — إجباري عملياً) ---- */
 window.bindEmailAsk = function(){

@@ -228,6 +228,8 @@ module.exports = async function handler(req, res) {
     if (action === 'verifyOtp') return await verifyOtpAction(res, body, req)
     if (action === 'resendOtp') return await resendOtp(res, body, req)
     if (action === 'bindEmail') return await bindEmail(res, body, req)
+    if (action === 'forgotPassword') return await forgotPassword(res, body, req)
+    if (action === 'resetPassword') return await resetPassword(res, body, req)
     if (action === 'me') return await me(req, res)
     return json(res, 400, { ok: false, error: 'unknown_action' })
   } catch (e) {
@@ -534,6 +536,76 @@ async function verifyOtpAction(res, b, req) {
   }
 
   return json(res, 400, { ok: false, error: 'bad_pending' })
+}
+
+// ------------------------------------------------------------ نسيت كلمة المرور / إعادة التعيين (OTP)
+async function forgotPassword(res, b, req) {
+  const phone = normalizePhone(b.phone)
+  if (!PHONE_RE.test(phone)) return json(res, 400, { ok: false, error: 'bad_phone' })
+
+  const ip = getClientIp(req)
+  if (!(await verifyTurnstile(String(b.turnstileToken || ''), ip))) {
+    return json(res, 403, { ok: false, error: 'turnstile_failed' })
+  }
+
+  const profile = await dal.find('ur_profiles', { phone })
+  if (!profile) return json(res, 404, { ok: false, error: 'not_registered', message: '⚠️ هذا الرقم غير مسجّل لدينا' })
+  if (profile.status === 'suspended') return json(res, 403, { ok: false, error: 'suspended' })
+  if (!profile.email) {
+    return json(res, 400, { ok: false, error: 'no_email', message: '⚠️ هذا الحساب غير مربوط ببريد إلكتروني — تواصل مع الإدارة للمساعدة' })
+  }
+
+  let extra = {}
+  try {
+    extra = await issueOtp(profile.email, 'reset', ip)
+  } catch (e) {
+    if (e.code === 'mail_not_configured' || e.code === 'mail_failed') {
+      return json(res, 503, { ok: false, error: 'mail_not_configured', message: '📧 خدمة إرسال الرموز غير متاحة حالياً' })
+    }
+    throw e
+  }
+
+  const parts = profile.email.split('@')
+  const maskedEmail = (parts[0].length <= 2 ? parts[0][0] + '*' : parts[0][0] + '***' + parts[0].slice(-1)) + '@' + (parts[1] || '')
+
+  const deviceId = deviceFp(req, b)
+  const pending = signToken({ scope: 'otp', purpose: 'reset', sub: profile.id, ph: phone, em: profile.email, fp: deviceId }, 0.007)
+  await secEvent(profile.id, 'forgot_password_requested', {}, ip)
+  return json(res, 200, Object.assign({ ok: true, needsOtp: true, pending: pending, email: maskedEmail }, extra))
+}
+
+async function resetPassword(res, b, req) {
+  const payload = verifyToken(String(b.pending || ''))
+  if (!payload || payload.scope !== 'otp' || payload.purpose !== 'reset') {
+    return json(res, 401, { ok: false, error: 'bad_pending' })
+  }
+  const newPass = String(b.newPass || '')
+  if (newPass.length < 6) return json(res, 400, { ok: false, error: 'bad_pass', message: '🔑 كلمة المرور يجب أن تكون 6 أحرف على الأقل' })
+
+  const ip = getClientIp(req)
+  const profile = await dal.find('ur_profiles', { id: payload.sub })
+  if (!profile) return json(res, 404, { ok: false, error: 'user_not_found' })
+  const email = payload.em || profile.email
+  if (!email) return json(res, 400, { ok: false, error: 'bad_pending' })
+
+  await consumeOtp(email, 'reset', b.code) // يرمي bad_otp
+
+  const passHash = await hashPassword(newPass)
+  await dal.update('ur_profiles', { id: profile.id }, { pass_hash: passHash, email_verified: true })
+  await clearLoginFails(ip)
+  await secEvent(profile.id, 'password_reset_success', {}, ip)
+
+  const deviceId = payload.fp || deviceFp(req, b)
+  if (deviceId) {
+    try {
+      const known = await activeDevice(profile.id, deviceId)
+      if (!known) {
+        await activateDevice(profile, deviceId, req.headers['user-agent'], ip)
+      }
+    } catch (_) {}
+  }
+  const token = signToken({ sub: profile.id, role: profile.role, phone: profile.phone, dv: deviceId })
+  return json(res, 200, { ok: true, token: token, userId: profile.id, role: profile.role, message: '🎉 تم تغيير كلمة المرور بنجاح!' })
 }
 
 async function resendOtp(res, b, req) {
