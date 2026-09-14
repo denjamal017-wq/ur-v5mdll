@@ -1,4 +1,4 @@
-/* ================= مدللني — رقعة الهوية v8.8 (تُحمَّل بعد cloud.js) =================
+/* ================= مدللني — رقعة الهوية v8.8/v9 (تُحمَّل بعد cloud.js) =================
    ربط البريد إجباري للحسابات القديمة (مودال bindEmail) + حقل البريد بفورم التسجيل
    وتلميح الدخول بحقن متزامن رباعي التغطية (فوري + render + hashchange + مراقب DOM).
    مكتفية ذاتياً: تعتمد فقط على الدوال العامة (window) لـ app.js/cloud.js. */
@@ -14,8 +14,8 @@ var ERR88={
   otp_expired:'⏰ انتهت صلاحية الرمز — اطلب رمزاً جديداً',
   otp_wait:'⏰ انتظر دقيقة قبل طلب رمز جديد',
   otp_limit:'⏰ وصلت الحد اليومي لرموز التحقق — حاول غداً',
-  mail_not_configured:'⚠️ خدمة البريد متوقفة مؤقتاً — راسل الإدارة',
-  mail_failed:'⚠️ ما انرسل البريد — جرّب ثانية أو راسل الإدارة',
+  mail_not_configured:'⚠️ خدمة الرموز غير مفعّلة — الإدارة تفعّل Email provider من Supabase',
+  mail_failed:'⚠️ ما انرسل الرمز — تأكد من البريد وحاول ثانية',
   device_in_use:'🚫 هذا الجهاز مرتبط بحساب آخر — جهاز واحد = حساب واحد',
   device_revoked:'📵 هذا الجهاز انسحب اعتماده — سجّل دخولك من جهاز معتمد',
   bad_pending:'⏰ الجلسة انتهت — عيد المحاولة من البداية',
@@ -68,7 +68,7 @@ window.openOtpStep = function(pending, email, purpose){
   var purposeTxt = purpose==='register'?'تفعيل حسابك':purpose==='device'?'تأكيد جهازك الجديد':purpose==='bind'?'ربط بريدك':'دخولك';
   openModal('📧 رمز التحقق من بريدك',
     '<div style="text-align:center;margin-bottom:10px"><span style="font-size:38px">📧</span></div>'
-    +'<p style="font-size:14px;color:var(--muted);text-align:center;line-height:1.9">أرسلنا رمزاً من 6 أرقام إلى<br><b style="direction:ltr;display:inline-block">'+esc(email)+'</b><br>اكتبه هنا حتى نكمل '+purposeTxt+' — صالح 10 دقائق ويُستخدم مرة وحدة.</p>'
+    +'<p style="font-size:14px;color:var(--muted);text-align:center;line-height:1.9">أرسلنا رمزاً من 6 أرقام إلى<br><b style="direction:ltr;display:inline-block">'+esc(email)+'</b><br>اكتبه هنا حتى نكمل '+purposeTxt+' — صالح لساعة ويُستخدم مرة وحدة.</p>'
     +'<div class="field"><input id="otpCode" inputmode="numeric" maxlength="6" placeholder="••••••" style="text-align:center;font-size:26px;font-weight:900;letter-spacing:12px;direction:ltr"></div>'
     +'<div style="display:flex;justify-content:space-between;align-items:center;margin-top:4px"><button class="btn btn-ghost btn-sm" onclick="resendOtpCode()">↺ إعادة الإرسال</button><span style="font-size:12px;color:var(--faint)">ما وصلك؟ راجع السبام</span></div>',
     '✓ تأكيد', function(){ window.verifyOtpCode(); });

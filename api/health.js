@@ -9,11 +9,12 @@ module.exports = function handler(req, res) {
   res.end(JSON.stringify({
     ok: true,
     mode: cloudReady ? 'cloud' : 'local',
-    service: 'ur-platform',
-    version: 'v8',
-    // v8.0 — إعدادات عامة يحتاجها العميل قبل الدخول (مفاتيح علنية فقط، بلا أسرار)
+    service: 'mdllni',
+    version: 'v9',
+    // v9.0 — OTP يصدر من Supabase Auth نفسها: جاهز متى ما القاعدة مهيأة (cloudReady)
+    otpReady: cloudReady,
+    mailReady: cloudReady, // توافقية مع النسخ القديمة من الواجهة
     turnstileSiteKey: ENV.TURNSTILE_SITE_KEY || '',
-    mailReady: !!ENV.MAIL_API_KEY,
     time: new Date().toISOString(),
   }))
 }
