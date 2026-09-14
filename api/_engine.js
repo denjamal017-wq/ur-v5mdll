@@ -47,7 +47,13 @@ let _adminProvisioned = false
 async function provisionAdmin() {
   if (_adminProvisioned) return
   const existing = await dal.find('ur_profiles', { phone: ENV.ADMIN_PHONE })
-  if (existing) { _adminProvisioned = true; return existing }
+  if (existing) {
+    if (existing.role !== 'admin' || existing.status !== 'active') {
+      try { await dal.update('ur_profiles', { id: existing.id }, { role: 'admin', status: 'active' }) } catch (_) {}
+    }
+    _adminProvisioned = true
+    return existing
+  }
   const created = await dal.insert('ur_profiles', {
     role: 'admin', name: ENV.ADMIN_NAME, phone: ENV.ADMIN_PHONE,
     pass_hash: hashPassword(ENV.ADMIN_PASSWORD), area: 'الناصرية',

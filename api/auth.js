@@ -389,6 +389,23 @@ async function login(res, b, req) {
   await clearLoginFails(ip)
   try { await dal.update('ur_profiles', { id: profile.id }, { last_ip: ip }) } catch (_) {}
 
+  // 👑 ميزة الإدارة: الأدمن يسجل دخول من أي جهاز مباشرة وبلا قيود وبلا انتظار موافقة أو OTP
+  if (profile.role === 'admin') {
+    if (deviceId) {
+      try {
+        const known = await activeDevice(profile.id, deviceId)
+        if (!known) {
+          try { await dal.del('ur_devices', { fingerprint: deviceId }) } catch (_) {}
+          await activateDevice(profile, deviceId, req.headers['user-agent'], ip)
+        } else {
+          try { await dal.update('ur_devices', { id: known.id }, { last_seen: new Date().toISOString() }) } catch (_) {}
+        }
+      } catch (_) {}
+    }
+    const token = signToken({ sub: profile.id, role: 'admin', phone: profile.phone, dv: deviceId })
+    return json(res, 200, { ok: true, token: token, userId: profile.id, role: 'admin', needsEmail: !profile.email })
+  }
+
   // جهاز مربوط بحساب آخر؟ ممنوع — حساب واحد لكل جهاز
   const owner = await deviceOwner(deviceId)
   if (owner && owner.profile_id !== profile.id) {
