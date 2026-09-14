@@ -1,6 +1,6 @@
 /* ================= مدللني — رقعة الهوية v8.8 (تُحمَّل بعد cloud.js) =================
    ربط البريد إجباري للحسابات القديمة (مودال bindEmail) + حقل البريد بفورم التسجيل
-   وتلميح الدخول بحقن متزامن ثلاثي التغطية (فوري + بعد كل render + عند تغيير الهاش).
+   وتلميح الدخول بحقن متزامن رباعي التغطية (فوري + render + hashchange + مراقب DOM).
    مكتفية ذاتياً: تعتمد فقط على الدوال العامة (window) لـ app.js/cloud.js. */
 (function(){
 'use strict';
@@ -139,10 +139,19 @@ window.doLogin = function(){
   });
 };
 
-/* ---- 5) التثبيت: فوري + بعد كل render + عند كل تنقل ---- */
+/* ---- 5) التثبيت: فوري + بعد كل render + عند كل تنقل + مراقب DOM (يقتل التذبذب نهائياً) ---- */
 var _r88 = window.render;
 window.render = function(){ if(_r88) _r88.apply(this, arguments); injectAuthFields(); };
 window.addEventListener('hashchange', function(){ setTimeout(injectAuthFields, 0); });
+/* مراقب DOM: أي رسم يزرع حقول الفورم بأي مسار (تبويب/تنقل/إعادة رسم داخلية) → الحقن يلحقه فوراً.
+   الحقن idempotent (يتحقق قبل الزرع) فلا حلقات ولا تكرار. */
+var _injT88 = null;
+function scheduleInject88(){ if(_injT88) return; _injT88 = setTimeout(function(){ _injT88 = null; injectAuthFields(); }, 40); }
+try{
+  new MutationObserver(function(muts){
+    for (var i = 0; i < muts.length; i++){ if (muts[i].addedNodes && muts[i].addedNodes.length){ scheduleInject88(); return; } }
+  }).observe(document.body, { childList: true, subtree: true });
+}catch(e){}
 injectAuthFields();
 
 })();
