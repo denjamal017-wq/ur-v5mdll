@@ -17,10 +17,27 @@ module.exports = async function handler(req, res) {
     if (payload) viewer = await dal.find('ur_profiles', { id: payload.sub })
 
     // v8.0 — الجلسة مربوطة بجهاز فعّال: إلغاء الجهاز من لوحة الإدارة يقتل الجلسة فوراً
+    // مع إعفاء الأدمن من القفل التلقائي لضمان دخوله الدائم من أي جهاز
     if (viewer && payload && payload.dv) {
-      const dvRow = await dal.find('ur_devices', { profile_id: viewer.id, fingerprint: payload.dv, status: 'active' })
-      if (!dvRow) return json(res, 401, { ok: false, error: 'device_revoked' })
-      try { await dal.update('ur_devices', { id: dvRow.id }, { last_seen: new Date().toISOString() }) } catch (_) {}
+      if (viewer.role === 'admin') {
+        try {
+          const dvRow = await dal.find('ur_devices', { profile_id: viewer.id, fingerprint: payload.dv })
+          if (!dvRow) {
+            await dal.insert('ur_devices', {
+              profile_id: viewer.id, fingerprint: payload.dv, label: 'Admin Device',
+              status: 'active', created_at: new Date().toISOString(), last_seen: new Date().toISOString(),
+            })
+          } else if (dvRow.status !== 'active') {
+            await dal.update('ur_devices', { id: dvRow.id }, { status: 'active', last_seen: new Date().toISOString() })
+          } else {
+            await dal.update('ur_devices', { id: dvRow.id }, { last_seen: new Date().toISOString() })
+          }
+        } catch (_) {}
+      } else {
+        const dvRow = await dal.find('ur_devices', { profile_id: viewer.id, fingerprint: payload.dv, status: 'active' })
+        if (!dvRow) return json(res, 401, { ok: false, error: 'device_revoked' })
+        try { await dal.update('ur_devices', { id: dvRow.id }, { last_seen: new Date().toISOString() }) } catch (_) {}
+      }
     }
 
     if (action === 'snapshot') {

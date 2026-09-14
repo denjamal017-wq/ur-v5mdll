@@ -718,6 +718,10 @@ function renderAuth(mode){
       <p style="font-size:14px;color:var(--muted);margin-bottom:22px">سجّل دخولك برقم هاتفك وكلمة المرور.</p>
       <div class="field"><label>رقم الهاتف</label><input id="lgPhone" placeholder="07XXXXXXXXX" inputmode="tel" maxlength="15" value="${esc(window._lastPhone||'')}"></div>
       <div class="field"><label>كلمة المرور</label><input id="lgPass" type="password" placeholder="••••••••" onkeydown="if(event.key==='Enter')doLogin()"></div>
+      <div id="lgForgotLink" style="display:flex;justify-content:space-between;align-items:center;margin:-4px 0 14px">
+        <span style="font-size:12.5px;color:var(--faint)">🔐 الدخول برقمك وكلمة المرور</span>
+        <button type="button" onclick="window.openForgotPasswordModal()" style="background:none;border:none;padding:0;color:var(--accent,#BE3A2B);font-size:13px;font-weight:700;cursor:pointer;text-decoration:underline;font-family:inherit">🔑 نسيت كلمة المرور؟</button>
+      </div>
       <div id="lgTurnstile" style="margin:4px 0 14px"></div>
       <button class="btn btn-primary btn-block" onclick="doLogin()">دخول ←</button>
       <div style="text-align:center;margin-top:16px"><a style="font-size:13.5px;color:var(--muted);cursor:pointer" onclick="go('#/auth/register')">ما عندك حساب؟ <b style="color:var(--ink)">سجّل الآن مجاناً</b></a></div>

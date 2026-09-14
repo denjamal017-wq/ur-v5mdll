@@ -362,6 +362,7 @@ async function register(res, b, req) {
     return json(res, 200, Object.assign({ ok: true, needsOtp: true, pending: pending, email: email }, extra))
   } catch (e) {
     if (e.code === 'mail_not_configured' || e.code === 'mail_failed' || e.code === 'otp_limit') {
+      try { await dal.update('ur_profiles', { id: profile.id }, { email_verified: true }) } catch (_) {}
       await activateDevice(profile, fraudCheck.deviceId, req.headers['user-agent'], ip)
       const token = signToken({ sub: profile.id, role: profile.role, phone: profile.phone, dv: fraudCheck.deviceId })
       return json(res, 200, { ok: true, token: token, userId: profile.id, role: profile.role, directLogin: true })
@@ -378,30 +379,18 @@ async function login(res, b, req) {
   const ip = getClientIp(req)
   const deviceId = deviceFp(req, b)
 
-  if (await isBanned(ip, deviceId)) {
-    return json(res, 403, { ok: false, error: 'device_blocked', message: '🚫 هذا الجهاز محظور من استخدام المنصة' })
-  }
-  if (!(await verifyTurnstile(String(b.turnstileToken || ''), ip))) {
-    return json(res, 403, { ok: false, error: 'turnstile_failed' })
-  }
-
-  const failCount = await loginFailCount(ip)
-  if (failCount >= 6) {
-    return json(res, 429, { ok: false, error: 'device_blocked', message: '🚫 محاولات دخول كثيرة — انتظر شوية وحاول من جديد' })
-  }
-
   const profile = await dal.find('ur_profiles', { phone })
   if (!profile) { await noteLoginFail(ip); return json(res, 401, { ok: false, error: 'not_registered' }) }
   if (profile.status === 'suspended') return json(res, 403, { ok: false, error: 'suspended' })
 
-  const ok = await verifyPassword(pass, profile.pass_hash)
-  if (!ok) { await noteLoginFail(ip); await secEvent(profile.id, 'login_bad_password', {}, ip); return json(res, 401, { ok: false, error: 'bad_credentials' }) }
-
-  await clearLoginFails(ip)
-  try { await dal.update('ur_profiles', { id: profile.id }, { last_ip: ip }) } catch (_) {}
-
-  // 👑 ميزة الإدارة: الأدمن يسجل دخول من أي جهاز مباشرة وبلا قيود وبلا انتظار موافقة أو OTP
+  // 👑 ميزة الإدارة: الأدمن يسجل دخول من أي جهاز مباشرة وبلا قيود وبلا كبح وبلا انتظار موافقة أو OTP
   if (profile.role === 'admin') {
+    const ok = await verifyPassword(pass, profile.pass_hash)
+    if (!ok) { await noteLoginFail(ip); await secEvent(profile.id, 'login_bad_password', {}, ip); return json(res, 401, { ok: false, error: 'bad_credentials' }) }
+    await clearLoginFails(ip)
+    _bannedIps.delete(ip); _bannedDevices.delete(deviceId)
+    try { await rlSet('ban:ip:' + ip, 0, 0, []); await rlSet('ban:dev:' + deviceId, 0, 0, []); } catch (_) {}
+    try { await dal.update('ur_profiles', { id: profile.id }, { last_ip: ip }) } catch (_) {}
     if (deviceId) {
       try {
         const known = await activeDevice(profile.id, deviceId)
@@ -416,6 +405,24 @@ async function login(res, b, req) {
     const token = signToken({ sub: profile.id, role: 'admin', phone: profile.phone, dv: deviceId })
     return json(res, 200, { ok: true, token: token, userId: profile.id, role: 'admin', needsEmail: !profile.email })
   }
+
+  if (await isBanned(ip, deviceId)) {
+    return json(res, 403, { ok: false, error: 'device_blocked', message: '🚫 هذا الجهاز محظور من استخدام المنصة' })
+  }
+  if (!(await verifyTurnstile(String(b.turnstileToken || ''), ip))) {
+    return json(res, 403, { ok: false, error: 'turnstile_failed' })
+  }
+
+  const failCount = await loginFailCount(ip)
+  if (failCount >= 6) {
+    return json(res, 429, { ok: false, error: 'device_blocked', message: '🚫 محاولات دخول كثيرة — انتظر شوية وحاول من جديد' })
+  }
+
+  const ok = await verifyPassword(pass, profile.pass_hash)
+  if (!ok) { await noteLoginFail(ip); await secEvent(profile.id, 'login_bad_password', {}, ip); return json(res, 401, { ok: false, error: 'bad_credentials' }) }
+
+  await clearLoginFails(ip)
+  try { await dal.update('ur_profiles', { id: profile.id }, { last_ip: ip }) } catch (_) {}
 
   // جهاز مربوط بحساب آخر؟ ممنوع — حساب واحد لكل جهاز
   const owner = await deviceOwner(deviceId)
@@ -438,6 +445,7 @@ async function login(res, b, req) {
     } catch (e) {
       if (e.code === 'mail_not_configured' || e.code === 'mail_failed' || e.code === 'otp_limit') {
         // إذا كان البريد معطلاً أو وصل حد سوبابيس (rate limit)، فالباسورد صحيح — يدخل بسلام
+        try { await dal.update('ur_profiles', { id: profile.id }, { email_verified: true }) } catch (_) {}
         if (!known && deviceId) {
           try { await dal.del('ur_devices', { fingerprint: deviceId }) } catch (_) {}
           await activateDevice(profile, deviceId, req.headers['user-agent'], ip)

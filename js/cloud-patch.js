@@ -14,8 +14,8 @@ var ERR88={
   otp_expired:'⏰ انتهت صلاحية الرمز — اطلب رمزاً جديداً',
   otp_wait:'⏰ انتظر دقيقة قبل طلب رمز جديد',
   otp_limit:'⏰ وصلت الحد اليومي لرموز التحقق — حاول غداً',
-  mail_not_configured:'⚠️ خدمة الرموز غير مفعّلة — الإدارة تفعّل Email provider من Supabase',
-  mail_failed:'⚠️ ما انرسل الرمز — تأكد من البريد وحاول ثانية',
+  mail_not_configured:'⚠️ خدمة إرسال الرموز غير متاحة مؤقتاً — انتظر قليلاً وحاول مجدداً',
+  mail_failed:'⚠️ تعذر إرسال الرمز للبريد حالياً — انتظر قليلاً وحاول مجدداً',
   device_in_use:'🚫 هذا الجهاز مرتبط بحساب آخر — جهاز واحد = حساب واحد',
   device_revoked:'📵 هذا الجهاز انسحب اعتماده — سجّل دخولك من جهاز معتمد',
   bad_pending:'⏰ الجلسة انتهت — عيد المحاولة من البداية',
@@ -23,12 +23,18 @@ var ERR88={
   network:'⚠️ ما وصلنا للسيرفر — تأكد من الإنترنت'
 };
 function errMsg88(c){ return ERR88[c] || ('⚠️ صار خطأ' + (c?(' ('+c+')'):'')); }
+function esc88(s){
+  if(typeof window.esc === 'function') return window.esc(s);
+  return String(s==null?'':s).replace(/[&<>"']/g, function(c){
+    return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];
+  });
+}
 function deviceFp88(){
   try{
     var fp = localStorage.getItem('__ur_did__');
     if(!fp){
       var raw = (navigator.userAgent || '') + '_' + screen.width + 'x' + screen.height;
-      fp = 'dev_' + hash(raw) + '_' + Math.random().toString(36).slice(2, 8);
+      fp = 'dev_' + (typeof hash === 'function' ? hash(raw) : 'fp') + '_' + Math.random().toString(36).slice(2, 8);
       localStorage.setItem('__ur_did__', fp);
     }
     return fp;
@@ -43,13 +49,13 @@ window.openModal = function(title, bodyHtml, btnText, btnCallback){
   if(!bg || !box) return;
   window._modalCallback = btnCallback || null;
   var html = '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px">'
-    + '<h3 style="margin:0;font-size:18.5px;font-weight:900">' + esc(title) + '</h3>'
+    + '<h3 style="margin:0;font-size:18.5px;font-weight:900">' + esc88(title) + '</h3>'
     + '<button type="button" onclick="closeModal()" style="background:none;border:none;font-size:22px;cursor:pointer;color:var(--muted);padding:0 6px;line-height:1">✕</button>'
     + '</div>'
     + '<div>' + bodyHtml + '</div>'
     + (btnText ? '<div class="actions" style="display:flex;gap:10px;margin-top:22px;justify-content:flex-end">'
       + '<button type="button" class="btn btn-ghost" onclick="closeModal()">إلغاء</button>'
-      + '<button type="button" class="btn btn-primary" onclick="if(window._modalCallback)window._modalCallback()">' + esc(btnText) + '</button>'
+      + '<button type="button" class="btn btn-primary" onclick="if(window._modalCallback)window._modalCallback()">' + esc88(btnText) + '</button>'
       + '</div>' : '');
   box.innerHTML = html;
   bg.classList.add('show');
@@ -205,7 +211,13 @@ window.doLogin = function(){
   if(!validPhone(phone)){ toast('📱 يرجى إدخال رقم هاتف صحيح يبدأ بـ 07'); return; }
   if(!pass){ toast('🔑 يرجى كتابة كلمة المرور'); return; }
   window._lastPhone = phone;
+
+  var btn = document.querySelector('.auth-card button.btn-primary');
+  if(btn){ if(btn._busy) return; btn._busy = true; btn.style.opacity = '0.6'; }
+  function done(){ if(btn){ btn._busy = false; btn.style.opacity = '1'; } }
+
   apiCall('auth', { action:'login', phone:phone, pass:pass, deviceId: deviceFp88(), turnstileToken: tsToken88() }).then(function(j){
+    done();
     if(j && j.needsOtp){ window.openOtpStep(j.pending, j.email || '', j.newDevice ? 'device' : 'login'); return; }
     if(j && j.needsDeviceApproval){ toast('🛡️ ' + (j.message || 'جهازك سجّل وينتظر موافقة الإدارة')); return; }
     setToken(j.token);
@@ -216,15 +228,17 @@ window.doLogin = function(){
       window._authNext = null;
       var target = (next && (next.indexOf('#/book') === 0 || next.indexOf('#/order/') === 0)) ? next : (j.role === 'admin' ? '#/admin' : '#/home');
       go(target);
-      if(j && j.needsEmail){ setTimeout(function(){ window.bindEmailAsk(); }, 900); }
+      if(j && j.needsEmail && j.role !== 'admin'){ setTimeout(function(){ window.bindEmailAsk(); }, 900); }
     });
   }).catch(function(e){
+    done();
     var c = e && e.code;
     if(c === 'device_blocked'){ toast('🚫 هذا الجهاز محظور من الاستخدام لتجاوز الحد الأقصى'); }
     else if(c === 'device_revoked'){ setToken(null); toast('📵 هذا الجهاز انسحب اعتماده من الإدارة'); }
     else if(c === 'not_registered'){ toast('⚠️ هذا الرقم غير مسجّل — يمكنك إنشاء حساب جديد'); }
     else if(c === 'bad_credentials'){ toast('⚠️ كلمة المرور غير صحيحة'); }
     else if(c === 'suspended'){ toast('🚫 حسابك موقوف — راجع الإدارة عبر الدعم'); }
+    else if(c === 'device_in_use'){ toast('🚫 هذا الجهاز مرتبط بحساب آخر — جهاز واحد = حساب واحد'); }
     else { toast(errMsg88(c)); }
   });
 };
