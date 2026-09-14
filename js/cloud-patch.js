@@ -36,14 +36,37 @@ function deviceFp88(){
 }
 function tsToken88(){ try{ if(window.turnstile && window._turnstileSiteKey){ return window.turnstile.getResponse() || ''; } }catch(e){} return ''; }
 
-/* ---- 1) حقول الفورم: بريد التسجيل + تلميح الدخول — حقن متزامن (بلا مؤقتات) ---- */
+/* ---- 0) نظام النوافذ المنبثقة الموحد (openModal) لجميع نوافذ النظام ---- */
+window.openModal = function(title, bodyHtml, btnText, btnCallback){
+  var bg = document.getElementById('modalBg');
+  var box = document.getElementById('modalBox');
+  if(!bg || !box) return;
+  window._modalCallback = btnCallback || null;
+  var html = '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px">'
+    + '<h3 style="margin:0;font-size:18.5px;font-weight:900">' + esc(title) + '</h3>'
+    + '<button type="button" onclick="closeModal()" style="background:none;border:none;font-size:22px;cursor:pointer;color:var(--muted);padding:0 6px;line-height:1">✕</button>'
+    + '</div>'
+    + '<div>' + bodyHtml + '</div>'
+    + (btnText ? '<div class="actions" style="display:flex;gap:10px;margin-top:22px;justify-content:flex-end">'
+      + '<button type="button" class="btn btn-ghost" onclick="closeModal()">إلغاء</button>'
+      + '<button type="button" class="btn btn-primary" onclick="if(window._modalCallback)window._modalCallback()">' + esc(btnText) + '</button>'
+      + '</div>' : '');
+  box.innerHTML = html;
+  bg.classList.add('show');
+};
+window.closeModal = function(){
+  var bg = document.getElementById('modalBg');
+  if(bg) bg.classList.remove('show');
+};
+
+/* ---- 1) حقول الفورم: بريد التسجيل + تلميح الدخول + نسيت كلمة المرور ---- */
 function injectAuthFields(){
   try{
     var rp=$('rgPhone');
     if(rp && !$('rgEmail') && rp.closest('.field')) rp.closest('.field').insertAdjacentHTML('afterend','<div class="field"><label>📧 البريد الإلكتروني (يوصلك عليه رمز التحقق — حماية ثانية لحسابك)</label><input id="rgEmail" type="email" dir="ltr" placeholder="name@gmail.com" autocomplete="email"></div>');
     var lp=$('lgPass');
     if(lp && !$('lgLoginHint') && lp.closest('.field')) lp.closest('.field').insertAdjacentHTML('beforebegin','<div id="lgLoginHint" class="hint" style="font-size:12.5px;color:var(--faint);margin:-6px 0 14px;line-height:1.8">🔐 الدخول برقمك وكلمة المرور — وبعدها يوصلك رمز تأكيد على بريدك</div>');
-    if(lp && !$('lgForgotLink') && lp.closest('.field')) lp.closest('.field').insertAdjacentHTML('afterend','<div id="lgForgotLink" style="text-align:left;margin:-6px 0 14px"><a href="javascript:void(0)" onclick="openForgotPasswordModal()" style="font-size:13px;color:var(--accent);text-decoration:none;font-weight:600">🔑 نسيت كلمة المرور؟</a></div>');
+    if(lp && !$('lgForgotLink') && lp.closest('.field')) lp.closest('.field').insertAdjacentHTML('afterend','<div id="lgForgotLink" style="text-align:left;margin:-4px 0 14px"><button type="button" onclick="window.openForgotPasswordModal()" style="background:none;border:none;padding:0;color:var(--accent,#BE3A2B);font-size:13px;font-weight:700;cursor:pointer;text-decoration:underline;font-family:inherit">🔑 نسيت كلمة المرور؟</button></div>');
   }catch(e){}
 }
 
