@@ -5,6 +5,5 @@
   "description": "مدللني — منصة خدمات الناصرية الآمنة",
   "type": "commonjs",
   "engines": { "node": ">=18" },
-  "scripts": { "test": "node test/security-v10.js" },
-  "dependencies": { "@supabase/supabase-js": "^2.45.0" }
+  "scripts": { "test": "node test/security-v10.js" }
 }
