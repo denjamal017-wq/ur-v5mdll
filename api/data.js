@@ -1,57 +1,27 @@
-// POST /api/data  { action: 'snapshot' | <mutation>, payload?: {...} }
-//  - snapshot works with or without auth (public homepage), role-scoped.
-//  - every mutation requires a valid Bearer token.
+// POST /api/data — بوابة بيانات مدللني المربوطة بجهاز موثوق.
+'use strict'
 const { cors, json, readBody, dal, getToken, verifyToken } = require('./_lib')
-const { snapshot, runAction, provisionAdmin } = require('./_engine')
-
+const { snapshot, runAction } = require('./_engine')
 module.exports = async function handler(req, res) {
   cors(res)
   if (req.method === 'OPTIONS') { res.statusCode = 204; return res.end() }
   try {
-    await provisionAdmin()
     const body = await readBody(req)
-    const action = body.action || (req.query && req.query.action) || 'snapshot'
-
+    const action = body.action || req.query && req.query.action || 'snapshot'
     const payload = verifyToken(getToken(req))
-    let viewer = null
-    if (payload) viewer = await dal.find('ur_profiles', { id: payload.sub })
-
-    // v8.0 — الجلسة مربوطة بجهاز فعّال: إلغاء الجهاز من لوحة الإدارة يقتل الجلسة فوراً
-    // مع إعفاء الأدمن من القفل التلقائي لضمان دخوله الدائم من أي جهاز
-    if (viewer && payload && payload.dv) {
-      if (viewer.role === 'admin') {
-        try {
-          const dvRow = await dal.find('ur_devices', { profile_id: viewer.id, fingerprint: payload.dv })
-          if (!dvRow) {
-            await dal.insert('ur_devices', {
-              profile_id: viewer.id, fingerprint: payload.dv, label: 'Admin Device',
-              status: 'active', created_at: new Date().toISOString(), last_seen: new Date().toISOString(),
-            })
-          } else if (dvRow.status !== 'active') {
-            await dal.update('ur_devices', { id: dvRow.id }, { status: 'active', last_seen: new Date().toISOString() })
-          } else {
-            await dal.update('ur_devices', { id: dvRow.id }, { last_seen: new Date().toISOString() })
-          }
-        } catch (_) {}
-      } else {
-        const dvRow = await dal.find('ur_devices', { profile_id: viewer.id, fingerprint: payload.dv, status: 'active' })
-        if (!dvRow) return json(res, 401, { ok: false, error: 'device_revoked' })
-        try { await dal.update('ur_devices', { id: dvRow.id }, { last_seen: new Date().toISOString() }) } catch (_) {}
-      }
+    let viewer = payload ? await dal.find('mdllni_profiles', { id: payload.sub }) : null
+    // لا إعفاء للأدمن: إلغاء الجهاز يقتل جلسته مثل أي حساب.
+    if (viewer && payload) {
+      if (!payload.dv) return json(res, 401, { ok: false, error: 'device_reauth_required' })
+      const device = await dal.find('mdllni_devices', { profile_id: viewer.id, fingerprint: payload.dv, status: 'active' })
+      if (!device) return json(res, 401, { ok: false, error: 'device_revoked' })
+      try { await dal.update('mdllni_devices', { id: device.id }, { last_seen: new Date().toISOString() }) } catch (_) {}
     }
-
-    if (action === 'snapshot') {
-      const db = await snapshot(viewer)
-      return json(res, 200, { ok: true, db })
-    }
-
+    if (action === 'snapshot') return json(res, 200, { ok: true, db: await snapshot(viewer) })
     if (!viewer) return json(res, 401, { ok: false, error: 'unauthorized' })
     if (viewer.status !== 'active') return json(res, 403, { ok: false, error: 'suspended' })
-
+    if (payload.limited) return json(res, 403, { ok: false, error: 'email_required' })
     const result = await runAction(viewer, action, body.payload || {})
-    const db = await snapshot(viewer)
-    return json(res, 200, { ok: true, result, db })
-  } catch (e) {
-    return json(res, e.status || 500, { ok: false, error: e.code || e.message || 'server_error' })
-  }
+    return json(res, 200, { ok: true, result, db: await snapshot(viewer) })
+  } catch (e) { return json(res, e.status || 500, { ok: false, error: e.code || e.message || 'server_error' }) }
 }
