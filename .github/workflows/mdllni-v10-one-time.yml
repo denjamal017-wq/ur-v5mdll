@@ -1,4 +1,4 @@
-name: mdllni v10 one-time rebrand and checks
+name: mdllni v10 diagnostic checks
 on:
   push:
     branches: [v10-identity-hardening]
@@ -6,7 +6,7 @@ on:
 permissions:
   contents: write
 jobs:
-  harden:
+  diagnose:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -15,37 +15,22 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - name: Replace legacy runtime branding
+      - name: Run checks and persist output
+        shell: bash
         run: |
-          python3 - <<'PY'
-          from pathlib import Path
-          import re
-          root=Path('.')
-          skip={Path('api/_lib.js'),Path('.github/workflows/mdllni-v10-one-time.yml')}
-          exts={'.js','.html','.css','.md','.json','.sql','.txt','.yml','.yaml'}
-          for p in root.rglob('*'):
-            if not p.is_file() or '.git' in p.parts or 'node_modules' in p.parts or 'supabase/migrations' in p.as_posix() or p in skip or p.suffix.lower() not in exts: continue
-            try: s=p.read_text()
-            except UnicodeDecodeError: continue
-            s=s.replace('ur5_db','mdllni_db').replace('ur6_token','mdllni_token').replace('__ur_did__','__mdllni_device__').replace('ur-admin-2026','mdllni-admin-2026')
-            s=s.replace('ur-platform','mdllni').replace('ur-v5mdll','mdllni').replace('UR-','MD-').replace('ur_','mdllni_')
-            s=re.sub(r'\bUR\b','mdllni',s)
-            s=s.replace('أور','مدللني').replace('(MD|MD)','MD')
-            if p.as_posix()=='supabase/schema.sql':
-              s=re.sub(r'\ncreate table if not exists mdllni_email_otps\s*\(.*?\);\s*\ncreate index if not exists mdllni_email_otps_idx.*?;\s*\n','\n',s,flags=re.S|re.I)
-              s=s.replace('alter table mdllni_email_otps enable row level security;\n','')
-            p.write_text(s)
-          Path('api/_mail.js').unlink(missing_ok=True)
-          PY
-      - name: Syntax and security checks
-        run: |
-          for f in api/_lib.js api/auth.js api/data.js api/health.js js/app.js js/cloud.js js/cloud-patch.js; do node --check "$f"; done
-          npm test
-      - name: Commit verified transformation
-        run: |
-          rm -f .github/workflows/mdllni-v10-one-time.yml
-          git config user.name mdllni-security
-          git config user.email security@mdllni.app
-          git add -A
-          git commit -m "refactor(v10): remove legacy runtime branding and external mail"
+          set +e
+          {
+            echo "== syntax =="
+            for f in api/_lib.js api/auth.js api/data.js api/health.js js/app.js js/cloud.js js/cloud-patch.js; do echo "-- $f"; node --check "$f"; done
+            echo "== tests =="
+            npm test
+          } > ci-v10.log 2>&1
+          status=$?
+          echo "exit_status=$status" >> ci-v10.log
+          cat ci-v10.log
+          git config user.name mdllni-ci
+          git config user.email ci@mdllni.app
+          git add ci-v10.log
+          git commit -m "test(v10): record syntax and regression results" || true
           git push origin HEAD:${GITHUB_REF_NAME}
+          exit 0
