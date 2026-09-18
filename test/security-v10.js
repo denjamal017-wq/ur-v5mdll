@@ -27,7 +27,7 @@ test('UI always carries device id and email',()=>{assert(ui.includes('__mdllni_d
 test('UI supports recovery only with OTP',()=>{assert(ui.includes("action:'forgotPassword'"));assert(ui.includes("action:'resetPassword'"));assert(ui.includes('verifyMdllniOtp'))})
 test('UI has self-service revoke',()=>{assert(ui.includes("action:'revokeMyDevice'"));assert(ui.includes('openTrustedDevices'))})
 test('health declares Supabase provider',()=>{assert(health.includes("authProvider: 'supabase-email-otp'"));assert(health.includes("version: 'v10'"))})
-test('cache-bust is v10',()=>{assert.strictEqual((index.match(/v=10\.0\.0/g)||[]).length,3)})
+test('all four assets are cache-busted to v10',()=>{assert.strictEqual((index.match(/v=10\.0\.0/g)||[]).length,4)})
 test('environment contains no external mail settings',()=>{assert(!/^MAIL_/m.test(env));assert(env.includes('SUPABASE_PUBLISHABLE_KEY'))})
 test('migration removes local OTP table',()=>{assert(migration.includes('drop table if exists public.ur_email_otps cascade'))})
 test('migration renames tables without copying financial rows',()=>{assert(migration.includes('alter table public.%I rename to %I'));assert(!/delete from public\.ur_(orders|ledger|payouts)/.test(migration))})
