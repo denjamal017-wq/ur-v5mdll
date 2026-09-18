@@ -1,4 +1,4 @@
-name: mdllni v10 diagnostic checks
+name: mdllni v10 direct-runner diagnostics
 on:
   push:
     branches: [v10-identity-hardening]
@@ -9,15 +9,12 @@ jobs:
   diagnose:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-      - name: Run checks and persist output
-        shell: bash
+      - name: Clone, check, and save result
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
+          git clone --branch "$GITHUB_REF_NAME" "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" repo
+          cd repo
           set +e
           {
             echo "== syntax =="
@@ -31,6 +28,6 @@ jobs:
           git config user.name mdllni-ci
           git config user.email ci@mdllni.app
           git add ci-v10.log
-          git commit -m "test(v10): record syntax and regression results" || true
-          git push origin HEAD:${GITHUB_REF_NAME}
+          git commit -m "test(v10): record direct-runner results" || true
+          git push origin HEAD:"$GITHUB_REF_NAME"
           exit 0
