@@ -1,0 +1,44 @@
+name: mdllni v11 hardening
+on:
+  push:
+    branches: [v11-complete-hardening]
+    paths:
+      - scripts/mdllni-hardening.js
+      - .github/workflows/mdllni-v11-hardening.yml
+permissions:
+  contents: write
+jobs:
+  harden:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Apply and verify hardening
+        shell: bash
+        run: |
+          set +e
+          : > hardening.log
+          node scripts/mdllni-hardening.js >> hardening.log 2>&1
+          code=$?
+          if [ "$code" -eq 0 ]; then
+            npm test >> hardening.log 2>&1
+            code=$?
+          fi
+          cat hardening.log
+          git config user.name "mdllni-security-bot"
+          git config user.email "security@mdllni.app"
+          if [ "$code" -ne 0 ]; then
+            cp hardening.log /tmp/hardening.log
+            git reset --hard HEAD
+            cp /tmp/hardening.log hardening.log
+            git add hardening.log
+            git commit -m "test(security): capture v11 hardening failure" || true
+            git push || true
+            exit "$code"
+          fi
+          rm -f scripts/mdllni-hardening.js .github/workflows/mdllni-v11-hardening.yml hardening.log
+          git add -A
+          git diff --cached --check
+          git commit -m "security(v11): harden identity sessions finance and fraud controls"
+          git push
