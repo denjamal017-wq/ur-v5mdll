@@ -1,787 +1,152 @@
-// POST /api/auth  { action: 'register' | 'login' | 'verifyOtp' | 'resendOtp' | 'bindEmail' | 'me', ... }
-//  v8.0 — هوية أقوى بكثير:
-//  · بريد إلزامي + رمز OTP بخطوتين للتسجيل والدخول (بدل الاعتماد على الهاتف فقط)
-//  · جهاز واحد = حساب واحد (فهرس فريد بالقاعدة) — الجهاز الجديد لحساب قائم
-//    يحتاج رمز بريد ثم موافقة الإدارة (تبديل الهاتف العطلان بدون فقدان الحساب)
-//  · آخر IP موثّق للحساب (شبكة مكافحة التواطؤ بالمحرك) + أحداث أمنية دائمة
-//  · Cloudflare Turnstile اختياري عند ضبط المفاتيح + كبح القوة الغاشمة الدائم
-//  v8.8 — سد ثغرة: حساب بريده غير مفعّل ما يدخل بلا رمز (المسار المتساهل صار فقط
-//  لمن لا بريد له إطلاقاً) + bindEmail: ربط إجباري لبريد الحسابات القديمة
-//  v9.0 — رموز OTP تصدر وتُتحقق من Supabase Auth نفسها (GoTrue عبر HTTPS صرف):
-//  لا مزود بريد خارجي ولا MAIL_* — التفعيل يكون من لوحة Supabase (Email provider)
-//  والكولداون والحد اليومي والأجهزة والجلسات تبقى كلها بقواعدنا نحن.
-const { cors, json, readBody, dal, hashPassword, verifyPassword, signToken, getToken, verifyToken, verifyTurnstile, ENV, crypto } = require('./_lib')
-const { provisionAdmin } = require('./_engine')
-const { sendOtpEmail } = require('./_mail')
-
-function normalizePhone(p) {
-  if (!p) return ''
-  let s = String(p)
-    .replace(/[٠-٩]/g, (d) => '٠١٢٣٤٥٦٧٨٩'.indexOf(d))
-    .replace(/[۰-۹]/g, (d) => '۰۱۲۳۴۵۶۷۸۹'.indexOf(d))
-    .replace(/[\s\-\(\)\.]/g, '')
-  if (s.startsWith('+964')) s = '0' + s.slice(4)
-  else if (s.startsWith('00964')) s = '0' + s.slice(5)
-  else if (s.startsWith('964')) s = '0' + s.slice(3)
-  else if (s.length === 10 && s.startsWith('7')) s = '0' + s
-  return s
+// مدللني v10 — كلمة مرور + OTP من Supabase Auth فقط + ثقة أجهزة متكيفة.
+'use strict'
+const { ENV, cloudReady, cors, json, readBody, dal, getToken, verifyToken, signToken, hashPassword, verifyPassword, verifyTurnstile, sha256, crypto } = require('./_lib')
+const T = { profiles: 'mdllni_profiles', providers: 'mdllni_providers', devices: 'mdllni_devices', rates: 'mdllni_rate_limits', events: 'mdllni_security_events', notifications: 'mdllni_notifications' }
+const OTP_DAYS = 10 / 1440
+const TRUST_DAYS = 30
+const ADMIN_TRUST_DAYS = 7
+const MAX_DEVICES = 3
+function fail(status, code, extra) { const e = new Error(code); e.status = status; e.code = code; if (extra) Object.assign(e, extra); throw e }
+function phone(v) { let s = String(v || '').replace(/[^0-9+]/g, ''); if (s.startsWith('+964')) s = '0' + s.slice(4); else if (s.startsWith('964')) s = '0' + s.slice(3); return s }
+function email(v) { return String(v || '').trim().toLowerCase() }
+function emailOk(v) { return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v) && v.length <= 254 }
+function deviceOk(v) { return /^[A-Za-z0-9._:-]{8,160}$/.test(String(v || '')) }
+function ip(req) { return String(req.headers['x-forwarded-for'] || req.headers['x-real-ip'] || '').split(',')[0].trim().slice(0, 80) }
+function label(v, req) { return String(v || req.headers['user-agent'] || 'جهاز').replace(/[<>]/g, '').trim().slice(0, 120) }
+function rid() { return crypto.randomBytes(18).toString('hex') }
+function mask(v) { const p = String(v).split('@'); return p.length === 2 ? (p[0].slice(0, 2) || '*') + '***@' + p[1] : '' }
+function safeProfile(p) { if (!p) return null; const x = Object.assign({}, p); delete x.pass_hash; delete x.devices; delete x.last_ip; delete x.auth_user_id; return x }
+async function rateGet(key) { return await dal.find(T.rates, { key }) }
+async function rateSet(key, count, first, items) { const old = await rateGet(key); const row = { count: Number(count || 0), first: Number(first || Date.now()), items: Array.isArray(items) ? items : [], updated_at: new Date().toISOString() }; if (old) await dal.update(T.rates, { key }, row); else await dal.insert(T.rates, Object.assign({ key }, row)); return row }
+async function rateClear(key) { try { await dal.del(T.rates, { key }) } catch (_) {} }
+async function event(kind, profileId, network, meta) { try { await dal.insert(T.events, { profile_id: profileId || null, kind, meta: meta || {}, ip: network || '', created_at: new Date().toISOString() }) } catch (_) {} }
+async function notify(profileId, text) { try { await dal.insert(T.notifications, { user_id: profileId, icon: '🛡️', body: text, order_id: null, read: false, created_at: new Date().toISOString() }) } catch (_) {} }
+async function ensureAdmin(targetPhone) {
+  if (targetPhone !== ENV.ADMIN_PHONE) return
+  if (await dal.find(T.profiles, { phone: targetPhone })) return
+  if (!ENV.ADMIN_PASSWORD || ENV.ADMIN_PASSWORD.length < 8 || !emailOk(ENV.ADMIN_EMAIL)) fail(503, 'admin_not_configured')
+  await dal.insert(T.profiles, { role: 'admin', name: ENV.ADMIN_NAME, phone: targetPhone, pass_hash: hashPassword(ENV.ADMIN_PASSWORD), area: 'الناصرية', status: 'active', devices: [], email: ENV.ADMIN_EMAIL, email_verified: false, last_ip: '', created_at: new Date().toISOString() })
 }
-
-const PHONE_RE = /^07[0-9]{9}$/
-const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/
-const OTP_RESEND_COOLDOWN_MS = 60 * 1000
-const OTP_DAILY_LIMIT = 8
-
-// ------------------------------------------------------------ rate limits (دائمة بالقاعدة)
-const _bannedIps = new Set()
-const _bannedDevices = new Set()
-
-async function rlGet(key) {
-  try { return await dal.find('ur_rate_limits', { key: key }) } catch (_) { return null }
+async function supa(path, body) {
+  const key = ENV.PUBLISHABLE_KEY || ENV.SERVICE_KEY
+  if (!ENV.SUPABASE_URL || !key) fail(503, 'otp_not_configured')
+  let r
+  try { r = await fetch(ENV.SUPABASE_URL.replace(/\/$/, '') + '/auth/v1/' + path, { method: 'POST', headers: { apikey: key, Authorization: 'Bearer ' + key, 'Content-Type': 'application/json', 'X-Client-Info': 'mdllni-server/10' }, body: JSON.stringify(body) }) } catch (_) { fail(503, 'otp_provider_unavailable') }
+  const text = await r.text().catch(() => '')
+  let data = {}; try { data = text ? JSON.parse(text) : {} } catch (_) {}
+  return { ok: r.ok, status: r.status, data, retryAfter: Number(r.headers && r.headers.get && r.headers.get('retry-after') || 0) }
 }
-async function rlSet(key, count, first, items) {
-  const row = { count: count, first: first, items: items || [], updated_at: new Date().toISOString() }
-  try {
-    const ex = await dal.find('ur_rate_limits', { key: key })
-    if (ex) await dal.update('ur_rate_limits', { key: key }, row)
-    else await dal.insert('ur_rate_limits', Object.assign({ key: key }, row))
-  } catch (_) {}
+async function sendOtp(address, purpose, createUser) {
+  const now = Date.now(), eh = sha256(address).slice(0, 24), cooldownKey = 'otp:cooldown:' + purpose + ':' + eh, dayKey = 'otp:day:' + eh
+  const cd = await rateGet(cooldownKey)
+  if (cd && now - Number(cd.first || 0) < 60000) fail(429, 'otp_cooldown', { retryAfter: Math.ceil((60000 - now + Number(cd.first)) / 1000) })
+  let day = await rateGet(dayKey); if (!day || now - Number(day.first || 0) >= 86400000) day = { count: 0, first: now }
+  if (Number(day.count || 0) >= 8) fail(429, 'otp_daily_limit')
+  const out = await supa('otp', { email: address, create_user: !!createUser })
+  if (!out.ok) { if (out.status === 429) fail(429, 'otp_provider_rate_limited', { retryAfter: out.retryAfter || 60 }); fail(503, 'otp_delivery_failed') }
+  await rateSet(cooldownKey, 1, now, []); await rateSet(dayKey, Number(day.count || 0) + 1, Number(day.first || now), [])
 }
-async function isBanned(ip, deviceId) {
-  if (_bannedIps.has(ip) || _bannedDevices.has(deviceId)) return true
-  const [b1, b2] = await Promise.all([rlGet('ban:ip:' + ip), rlGet('ban:dev:' + deviceId)])
-  if (b1) _bannedIps.add(ip)
-  if (b2) _bannedDevices.add(deviceId)
-  return !!(b1 || b2)
+function makePending(data) { return signToken(Object.assign({ scope: 'otp', jti: rid() }, data), OTP_DAYS) }
+function pending(token, expected) { const p = verifyToken(token); if (!p || p.scope !== 'otp' || !p.jti || !p.e || expected && p.p !== expected) fail(401, 'otp_session_expired'); return p }
+async function verifyOtp(p, code) {
+  code = String(code || '').replace(/\D/g, '')
+  if (!/^\d{6}$/.test(code)) fail(400, 'otp_invalid')
+  const key = 'otp:attempt:' + p.jti, row = await rateGet(key), attempts = Number(row && row.count || 0)
+  if (attempts >= 5) fail(429, 'otp_attempts_exhausted')
+  const out = await supa('verify', { type: 'email', email: p.e, token: code })
+  if (!out.ok) { await rateSet(key, attempts + 1, Number(row && row.first || Date.now()), []); if (out.status === 429) fail(429, 'otp_provider_rate_limited', { retryAfter: out.retryAfter || 60 }); fail(400, attempts + 1 >= 5 ? 'otp_attempts_exhausted' : 'otp_invalid') }
+  const user = out.data && out.data.user
+  if (!user || email(user.email) !== email(p.e)) fail(401, 'otp_identity_mismatch')
+  await rateClear(key)
+  return user
 }
-async function banBoth(ip, deviceId) {
-  _bannedIps.add(ip); _bannedDevices.add(deviceId)
-  await rlSet('ban:ip:' + ip, 1, Date.now(), [])
-  await rlSet('ban:dev:' + deviceId, 1, Date.now(), [])
-  console.warn('[SECURITY FRAUD ALERT] Banned IP ' + ip + ' and Device ' + deviceId + ' for registering > 3 phone numbers!')
+function loginKey(profileId, network) { return 'login:' + profileId + ':' + sha256(network || 'unknown').slice(0, 18) }
+async function gate(profileId, network) { const row = await rateGet(loginKey(profileId, network)); if (!row) return { count: 0, until: 0 }; if (Date.now() - Number(row.first || 0) > 3600000) { await rateClear(loginKey(profileId, network)); return { count: 0, until: 0 } } return { count: Number(row.count || 0), until: Number(Array.isArray(row.items) && row.items[0] || 0) } }
+async function badLogin(profileId, network) { const key = loginKey(profileId, network), now = Date.now(), old = await rateGet(key), fresh = old && now - Number(old.first || 0) <= 3600000, count = (fresh ? Number(old.count || 0) : 0) + 1; let wait = count >= 12 ? 3600000 : count >= 8 ? 900000 : count >= 5 ? 60000 : 0; await rateSet(key, count, fresh ? Number(old.first) : now, [wait ? now + wait : 0]); return count }
+async function devices(profileId) { return await dal.all(T.devices, { profile_id: profileId }) }
+async function activeDevice(profileId, fp) { return await dal.find(T.devices, { profile_id: profileId, fingerprint: fp, status: 'active' }) }
+async function updateDevice(id, patch) { try { return await dal.update(T.devices, { id }, patch) } catch (e) { const minimal = {}; for (const k of ['status', 'label', 'last_seen', 'note']) if (Object.prototype.hasOwnProperty.call(patch, k)) minimal[k] = patch[k]; if (Object.keys(minimal).length) return await dal.update(T.devices, { id }, minimal); throw e } }
+async function trustDevice(profile, fp, deviceLabel, req, network, reason) {
+  if (!deviceOk(fp)) fail(400, 'bad_device')
+  const now = new Date(), trustDays = profile.role === 'admin' ? ADMIN_TRUST_DAYS : TRUST_DAYS, until = new Date(now.getTime() + trustDays * 86400000).toISOString()
+  const rows = await devices(profile.id); let current = rows.filter((d) => d.fingerprint === fp).sort((a, b) => new Date(b.last_seen || 0) - new Date(a.last_seen || 0))[0]
+  const otherActive = rows.filter((d) => d.status === 'active' && (!current || d.id !== current.id))
+  if ((!current || current.status !== 'active') && otherActive.length >= MAX_DEVICES) { otherActive.sort((a, b) => new Date(a.last_seen || a.created_at || 0) - new Date(b.last_seen || b.created_at || 0)); await updateDevice(otherActive[0].id, { status: 'revoked', note: 'استبدل تلقائياً بجهاز أحدث', revoked_at: now.toISOString(), revoked_reason: 'automatic_rotation' }); await notify(profile.id, 'تم إلغاء أقدم جهاز غير مستخدم لأن الحد الأعلى ثلاثة أجهزة.'); await event('device_rotated', profile.id, network, { device_id: otherActive[0].id }) }
+  const patch = { status: 'active', label: label(deviceLabel, req), last_seen: now.toISOString(), trusted_until: until, last_ip: network || '', user_agent_hash: sha256(req.headers['user-agent'] || '').slice(0, 40), risk_score: 0, note: reason || '', revoked_at: null, revoked_reason: '' }
+  if (current) { await updateDevice(current.id, patch); current = Object.assign(current, patch) } else { try { current = await dal.insert(T.devices, Object.assign({ profile_id: profile.id, fingerprint: fp, created_at: now.toISOString() }, patch)) } catch (_) { current = await dal.insert(T.devices, { profile_id: profile.id, fingerprint: fp, label: patch.label, status: 'active', note: patch.note, created_at: now.toISOString(), last_seen: now.toISOString() }) } }
+  const all = await devices(profile.id), fps = all.filter((d) => d.status === 'active').map((d) => d.fingerprint).slice(0, MAX_DEVICES)
+  try { await dal.update(T.profiles, { id: profile.id }, { devices: fps, last_ip: network || profile.last_ip || '' }) } catch (_) {}
+  try { const shared = (await dal.all(T.devices, { fingerprint: fp })).filter((d) => d.profile_id !== profile.id && d.status === 'active'); if (shared.length) await event('shared_device_verified', profile.id, network, { other_profiles: shared.length }) } catch (_) {}
+  await event('device_trusted', profile.id, network, { device_id: current && current.id, trust_days: trustDays })
+  return current
 }
-async function regPhones(key) {
-  const row = await rlGet(key)
-  return (row && Array.isArray(row.items)) ? row.items : []
-}
-async function noteRegistration(ip, deviceId, phone) {
-  for (const key of ['reg:ip:' + ip, 'reg:dev:' + deviceId]) {
-    const items = await regPhones(key)
-    if (items.indexOf(phone) < 0) {
-      items.push(phone)
-      await rlSet(key, items.length, Date.now(), items.slice(-20))
-    }
+async function linkIdentity(profile, user, address) { const patch = { email: email(address), email_verified: true, auth_user_id: user.id }; try { await dal.update(T.profiles, { id: profile.id }, patch) } catch (_) { delete patch.auth_user_id; await dal.update(T.profiles, { id: profile.id }, patch) } return Object.assign(profile, patch) }
+function session(profile, fp, limited) { return signToken({ sub: profile.id, role: profile.role, phone: profile.phone, dv: fp, limited: !!limited }) }
+async function createRegistration(r) {
+  if (await dal.find(T.profiles, { phone: r.phone })) fail(409, 'phone_taken')
+  if (await dal.find(T.profiles, { email: r.email })) fail(409, 'email_taken')
+  let profile = await dal.insert(T.profiles, { role: r.role, name: r.name, phone: r.phone, pass_hash: r.passHash, area: r.area, status: 'active', devices: [], email: r.email, email_verified: false, last_ip: r.ip || '', created_at: new Date().toISOString() })
+  if (r.role === 'provider') {
+    try { await dal.insert(T.providers, { profile_id: profile.id, service_id: r.serviceIds[0], service_ids: r.serviceIds, exp: r.exp, areas: r.areas, verified: 'pending', avail: true, rating_sum: 0, rating_count: 0, jobs: 0, balance: 0, settled: 0, sensitive: false, debt: 0, resp_sum: 0, resp_count: 0, drop_count: 0 }) }
+    catch (e) { try { await dal.del(T.profiles, { id: profile.id }) } catch (_) {}; throw e }
   }
+  return profile
 }
-async function loginFailCount(ip) {
-  const row = await rlGet('lf:' + ip)
-  if (!row || (Date.now() - (row.first || 0)) >= 600000) return 0
-  return row.count || 0
-}
-async function noteLoginFail(ip) {
-  const row = await rlGet('lf:' + ip)
-  const fresh = !row || (Date.now() - (row.first || 0)) >= 600000
-  await rlSet('lf:' + ip, fresh ? 1 : (row.count || 0) + 1, fresh ? Date.now() : row.first, [])
-}
-async function clearLoginFails(ip) { await rlSet('lf:' + ip, 0, 0, []) }
-
-function getClientIp(req) {
-  const xf = req.headers['x-forwarded-for']
-  if (xf) return xf.split(',')[0].trim()
-  return req.headers['x-real-ip'] || req.socket?.remoteAddress || '127.0.0.1'
-}
-
-// بصمة الجهاز: المعرف العميلي الثابت (localStorage) — نفس تنسيق الجيل السابق حتى
-// تبقى الأجهزة المرحّلة من القاعدة معروفة بعد التحديث. البصمة إشارة احتيال،
-// والسر الحقيقي هو كلمة المرور + رمز البريد — فاستنساخها وحده لا يفتح حساباً.
-function deviceFp(req, body) {
-  const raw = String(body.deviceId || body.deviceFingerprint || '').trim()
-  if (raw) return raw.slice(0, 120)
-  return ('ua:' + String(req.headers['user-agent'] || 'unknown')).slice(0, 120)
-}
-
-// ------------------------------------------------------------ أحداث أمنية + تنبيه إدارة
-async function secEvent(profileId, kind, meta, ip) {
-  try {
-    await dal.insert('ur_security_events', {
-      profile_id: profileId || null, kind: kind,
-      meta: meta || {}, ip: ip || '', created_at: new Date().toISOString(),
-    })
-  } catch (_) {}
-}
-async function notifyAdmins(icon, text, orderId) {
-  try {
-    const admins = await dal.all('ur_profiles', { role: 'admin' })
-    for (const a of admins) {
-      await dal.insert('ur_notifications', {
-        user_id: a.id, icon: icon, body: text, order_id: orderId || null,
-        read: false, created_at: new Date().toISOString(),
-      })
-    }
-  } catch (_) {}
-}
-
-// ------------------------------------------------------------ OTP عبر Supabase Auth (v9.0)
-//  الرمز يولّده ويرسله GoTrue لبريد المستخدم مباشرة — لا مزود بريد ولا حزم.
-//  نحتفظ نحن بالكولداون والحد اليومي (ur_rate_limits) فوق حدود Supabase نفسها.
-async function supaOtpCall(path, payload) {
-  try {
-    const r = await fetch(ENV.SUPABASE_URL + '/auth/v1/' + path, {
-      method: 'POST',
-      headers: { 'apikey': ENV.SERVICE_KEY, 'Authorization': 'Bearer ' + ENV.SERVICE_KEY, 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-    })
-    if (!r.ok) {
-      const errText = (typeof r.text === 'function') ? await r.text().catch(() => '') : ''
-      console.error('[supaOtpCall error]', path, r.status, errText)
-    }
-    return r.ok
-  } catch (err) {
-    console.error('[supaOtpCall exception]', path, err.message)
-    return false
-  }
-}
-
-function genCode() { return String(crypto.randomInt(100000, 1000000)) }
-
-async function latestOtp(email, purpose) {
-  try {
-    const rows = await dal.all('ur_email_otps', { email: email, purpose: purpose })
-    return rows.sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime())[0] || null
-  } catch (_) { return null }
-}
-
-// يرسل رمزاً جديداً؛ يرمي otp_wait / otp_limit / mail_failed
-async function issueOtp(email, purpose, ip) {
-  const cdKey = 'otp:cd:' + purpose + ':' + email
-  const cd = await rlGet(cdKey)
-  if (cd && (Date.now() - (cd.first || 0)) < OTP_RESEND_COOLDOWN_MS) {
-    const e = new Error('otp_wait'); e.code = 'otp_wait'; e.status = 429; throw e
-  }
-  const dayKey = 'otp:day:' + email
-  const day = await rlGet(dayKey)
-  const dayCount = (day && (Date.now() - (day.first || 0)) < 86400000) ? (day.count || 0) : 0
-  if (dayCount >= OTP_DAILY_LIMIT) {
-    const e = new Error('otp_limit'); e.code = 'otp_limit'; e.status = 429; throw e
-  }
-
-  // توليد رمز ستّي محلي كـ Fallback دائم
-  const code = genCode()
-  try {
-    await dal.insert('ur_email_otps', {
-      email: email, code_hash: hashPassword(code), purpose: purpose,
-      attempts: 0, expires_at: new Date(Date.now() + 3600000).toISOString(),
-      consumed_at: null, created_at: new Date().toISOString(),
-    })
-  } catch (_) {}
-
-  // محاولة الإرسال عبر Supabase GoTrue
-  let sent = false
-  if (purpose === 'reset') {
-    sent = await supaOtpCall('recover', { email: email })
-    if (!sent) sent = await supaOtpCall('otp', { email: email, create_user: false })
-  } else {
-    sent = await supaOtpCall('otp', { email: email, create_user: true })
-  }
-
-  // إذا لم ترسل سوبابيس (بسبب حد الإرسال المجاني 429 مثلاً)، نجرب المزود المباشر
-  if (!sent && typeof sendOtpEmail === 'function') {
-    try {
-      const r = await sendOtpEmail(email, code, purpose)
-      if (r && r.ok) sent = true
-    } catch (_) {}
-  }
-
-  await rlSet(cdKey, 1, Date.now(), [])
-  await rlSet(dayKey, dayCount + 1, dayCount ? day.first : Date.now(), [])
-  await secEvent(null, 'otp_issued', { email: email, purpose: purpose }, ip)
-
-  if (!sent) {
-    const e = new Error('mail_failed'); e.code = 'mail_failed'; e.status = 502; throw e
-  }
-  return {}
-}
-
-// يتحقق من الرمز عند القاعدة الداخلية أو Supabase (أحادي الاستخدام)؛ يرمي bad_otp
-//  وعند النجاح يصفّر الكولداون حتى يكدر المستخدم يدخل فوراً من جديد إذا انغلق.
-async function consumeOtp(email, purpose, code) {
-  const token = String(code || '').trim()
-  if (!/^\d{6,8}$/.test(token)) { const e = new Error('bad_otp'); e.code = 'bad_otp'; throw e }
-
-  // 1) تحقق من رمز ur_email_otps الداخلي
-  const row = await latestOtp(email, purpose)
-  if (row && !row.consumed_at && new Date(row.expires_at).getTime() >= Date.now()) {
-    if ((row.attempts || 0) < 6 && verifyPassword(token, row.code_hash)) {
-      try { await dal.update('ur_email_otps', { id: row.id }, { consumed_at: new Date().toISOString() }) } catch (_) {}
-      try { await rlSet('otp:cd:' + purpose + ':' + email, 0, 0, []) } catch (_) {}
-      return true
-    } else {
-      try { await dal.update('ur_email_otps', { id: row.id }, { attempts: (row.attempts || 0) + 1 }) } catch (_) {}
-    }
-  }
-
-  // 2) تحقق من Supabase GoTrue
-  const verifyType = purpose === 'reset' ? 'recovery' : (purpose === 'register' ? 'signup' : 'email')
-  let ok = await supaOtpCall('verify', { type: verifyType, email: email, token: token })
-  if (!ok && verifyType !== 'email') {
-    ok = await supaOtpCall('verify', { type: 'email', email: email, token: token })
-  }
-  if (!ok) { const e = new Error('bad_otp'); e.code = 'bad_otp'; throw e }
-  try { await rlSet('otp:cd:' + purpose + ':' + email, 0, 0, []) } catch (_) {}
-  return true
-}
-
-// ------------------------------------------------------------ جهاز الحساب
-async function activeDevice(profileId, fp) {
-  if (!fp) return null
-  return await dal.find('ur_devices', { profile_id: profileId, fingerprint: fp, status: 'active' })
-}
-async function deviceOwner(fp) {
-  if (!fp) return null
-  return await dal.find('ur_devices', { fingerprint: fp, status: 'active' })
-}
-async function countActiveDevices(profileId) {
-  return (await dal.all('ur_devices', { profile_id: profileId, status: 'active' })).length
-}
-// تفعيل جهاز (مع مزامنة المصفوفة القديمة profiles.devices لكشف التعامل الذاتي)
-async function activateDevice(profile, fp, label, ip) {
-  try {
-    await dal.insert('ur_devices', {
-      profile_id: profile.id, fingerprint: fp, label: String(label || '').slice(0, 80),
-      status: 'active', created_at: new Date().toISOString(), last_seen: new Date().toISOString(),
-    })
-  } catch (e) {
-    if (String((e && e.message) || '').indexOf('duplicate') >= 0) {
-      const owner = await deviceOwner(fp)
-      if (owner && owner.profile_id === profile.id) {
-        try { await dal.update('ur_devices', { id: owner.id }, { last_seen: new Date().toISOString() }) } catch (_) {}
-      } else {
-        const err = new Error('device_in_use'); err.code = 'device_in_use'; err.status = 403; throw err
-      }
-    } else throw e
-  }
-  const devs = Array.from(new Set([].concat(profile.devices || [], [fp]))).slice(-10)
-  try { await dal.update('ur_profiles', { id: profile.id }, { devices: devs, last_ip: ip || profile.last_ip || '' }) } catch (_) {}
-  await secEvent(profile.id, 'device_activated', { fp: fp.slice(0, 24) }, ip)
-}
-
-async function checkDeviceFraud(req, body, phone) {
-  const ip = getClientIp(req)
-  const deviceId = deviceFp(req, body)
-  if (await isBanned(ip, deviceId)) {
-    return { blocked: true, error: 'device_blocked', message: '🚫 تم حظر هذا الجهاز / عنوان IP لتجاوز الحد الأقصى المسموح به لإنشاء الحسابات (أكثر من 3 حسابات)' }
-  }
-  const ipPhones = await regPhones('reg:ip:' + ip)
-  const devPhones = await regPhones('reg:dev:' + deviceId)
-  if ((ipPhones.length >= 3 && ipPhones.indexOf(phone) < 0) || (devPhones.length >= 3 && devPhones.indexOf(phone) < 0)) {
-    await banBoth(ip, deviceId)
-    return { blocked: true, error: 'device_blocked', message: '🚫 تم حظر هذا الجهاز / عنوان IP لتجاوز الحد الأقصى المسموح به (أكثر من 3 حسابات)' }
-  }
-  return { blocked: false, ip, deviceId }
-}
-
-// ------------------------------------------------------------ handler
-module.exports = async function handler(req, res) {
-  cors(res)
-  if (req.method === 'OPTIONS') { res.statusCode = 204; return res.end() }
-  try {
-    await provisionAdmin()
-    const body = await readBody(req)
-    const action = body.action || (req.query && req.query.action)
-    if (action === 'register') return await register(res, body, req)
-    if (action === 'login') return await login(res, body, req)
-    if (action === 'verifyOtp') return await verifyOtpAction(res, body, req)
-    if (action === 'resendOtp') return await resendOtp(res, body, req)
-    if (action === 'bindEmail') return await bindEmail(res, body, req)
-    if (action === 'forgotPassword') return await forgotPassword(res, body, req)
-    if (action === 'resetPassword') return await resetPassword(res, body, req)
-    if (action === 'confirmEmailToken') return await confirmEmailToken(res, body, req)
-    if (action === 'directResetPassword') return await directResetPassword(res, body, req)
-    if (action === 'me') return await me(req, res)
-    return json(res, 400, { ok: false, error: 'unknown_action' })
-  } catch (e) {
-    return json(res, e.status || 500, { ok: false, error: e.code || e.message || 'server_error' })
-  }
-}
-
 async function register(res, b, req) {
-  const name = String(b.name || '').trim()
-  const phone = normalizePhone(b.phone)
-  const pass = String(b.pass || '')
-  const email = String(b.email || '').trim().toLowerCase()
-  const area = String(b.area || '').trim()
-  const role = b.role === 'provider' ? 'provider' : 'customer'
-
-  if (name.length < 2) return json(res, 400, { ok: false, error: 'bad_name' })
-  if (!PHONE_RE.test(phone)) return json(res, 400, { ok: false, error: 'bad_phone' })
-  if (!EMAIL_RE.test(email)) return json(res, 400, { ok: false, error: 'bad_email' })
-  if (pass.length < 6) return json(res, 400, { ok: false, error: 'bad_pass' })
-  if (!area) return json(res, 400, { ok: false, error: 'bad_area' })
-
-  const ip = getClientIp(req)
-  // تحقق البشر (إن فُعّل من الإدارة) قبل أي كتابة
-  if (!(await verifyTurnstile(String(b.turnstileToken || ''), ip))) {
-    return json(res, 403, { ok: false, error: 'turnstile_failed' })
-  }
-
-  const fraudCheck = await checkDeviceFraud(req, b, phone)
-  if (fraudCheck.blocked) return json(res, 403, { ok: false, error: fraudCheck.error, message: fraudCheck.message })
-
-  const dup = await dal.find('ur_profiles', { phone })
-  if (dup) return json(res, 409, { ok: false, error: 'phone_taken' })
-  const dupEmail = await dal.find('ur_profiles', { email: email })
-  if (dupEmail) return json(res, 409, { ok: false, error: 'email_taken' })
-  // الجهاز مربوط بحساب آخر فعّال؟ امنع من أول لحظة — حساب واحد لكل جهاز
-  const devOwner = await deviceOwner(fraudCheck.deviceId)
-  if (devOwner) {
-    await secEvent(null, 'register_on_used_device', { phone: phone }, ip)
-    return json(res, 403, { ok: false, error: 'device_in_use', message: '🚫 هذا الجهاز مرتبط بحساب آخر. جهاز واحد = حساب واحد — إذا كان حسابك، سجّل دخولك.' })
-  }
-
-  let primaryServiceRow = null
-  let selectedServiceIds = []
-
-  if (role === 'provider') {
-    let serviceIds = Array.isArray(b.serviceIds) ? b.serviceIds.slice(0, 3) : []
-    if (!serviceIds.length && b.serviceId) serviceIds = [b.serviceId]
-    if (!serviceIds.length) serviceIds = ['s1']
-
-    for (const sId of serviceIds) {
-      if (sId === 'custom' || (sId === serviceIds[0] && b.customServiceName)) {
-        const customName = String(b.customServiceName || 'مهنة خاصة').trim().slice(0, 60) || 'مهنة خاصة'
-        const customDesc = String(b.customServiceDesc || 'خدمة مخصصة').trim().slice(0, 200)
-        const minPrice = Math.min(500000, Math.max(1000, parseInt(b.customServiceMin, 10) || 10000))
-        const maxPrice = Math.min(500000, Math.max(minPrice, parseInt(b.customServiceMax, 10) || 40000))
-        const customId = 'svc_' + Date.now().toString(36)
-        try {
-          const sRow = await dal.insert('ur_services', {
-            id: customId, icon: '⭐', name: customName, cat: 'home', unit: 'خدمة',
-            min_price: minPrice, max_price: maxPrice, wave: 3, description: customDesc,
-            popular: false, sensitive: false, gold: false, active: true, created_at: new Date().toISOString()
-          })
-          selectedServiceIds.push(sRow.id)
-          if (!primaryServiceRow) primaryServiceRow = sRow
-        } catch (e) {
-          selectedServiceIds.push('s1')
-        }
-      } else {
-        const sRow = await dal.find('ur_services', { id: sId })
-        if (sRow) {
-          selectedServiceIds.push(sRow.id)
-          if (!primaryServiceRow) primaryServiceRow = sRow
-        }
-      }
-    }
-
-    if (!primaryServiceRow) primaryServiceRow = { id: 's1', name: 'خدمة عامة', sensitive: false }
-    if (!selectedServiceIds.length) selectedServiceIds = [primaryServiceRow.id]
-  }
-
-  const passHash = await hashPassword(pass)
-  let profile
-  try {
-    profile = await dal.insert('ur_profiles', {
-      phone, role, name, area, status: 'active', pass_hash: passHash,
-      email: email, email_verified: false, last_ip: ip,
-      devices: [],
-    })
-  } catch (e) {
-    const msg = String((e && e.message) || '')
-    if (msg.indexOf('duplicate') >= 0) {
-      return json(res, 409, { ok: false, error: msg.indexOf('email') >= 0 ? 'email_taken' : 'phone_taken' })
-    }
-    throw e
-  }
-
-  await noteRegistration(fraudCheck.ip, fraudCheck.deviceId, phone)
-
-  if (role === 'provider') {
-    const areas = Array.isArray(b.areas) && b.areas.length ? b.areas : [area]
-    const exp = Math.max(0, parseInt(b.exp, 10) || 0)
-    const sensitive = !!(primaryServiceRow && primaryServiceRow.sensitive)
-    await dal.insert('ur_providers', {
-      profile_id: profile.id,
-      service_id: primaryServiceRow.id,
-      service_ids: selectedServiceIds,
-      exp: exp, areas: areas,
-      verified: 'pending',
-      avail: true,
-      sensitive: sensitive
-    })
-    try {
-      await notifyAdmins('👷', 'مقدم خدمة جديد ينتظر التوثيق: ' + name + ' (' + selectedServiceIds.length + ' مهن: ' + primaryServiceRow.name + ') — منطقة ' + area, null)
-    } catch (_) {}
-  }
-
-  // البريد هو بوابة التفعيل — وإذا تعطلت سوبابيس أو بلغت الحد، لا نشنق المستخدم بل نفعّله مباشرة
-  let extra = {}
-  try {
-    extra = await issueOtp(email, 'register', ip)
-    const pending = signToken({ scope: 'otp', purpose: 'register', sub: profile.id, ph: phone, em: email, fp: fraudCheck.deviceId }, 0.007)
-    await secEvent(profile.id, 'register_pending_otp', {}, ip)
-    return json(res, 200, Object.assign({ ok: true, needsOtp: true, pending: pending, email: email }, extra))
-  } catch (e) {
-    if (e.code === 'mail_not_configured' || e.code === 'mail_failed' || e.code === 'otp_limit') {
-      try { await dal.update('ur_profiles', { id: profile.id }, { email_verified: true }) } catch (_) {}
-      await activateDevice(profile, fraudCheck.deviceId, req.headers['user-agent'], ip)
-      const token = signToken({ sub: profile.id, role: profile.role, phone: profile.phone, dv: fraudCheck.deviceId })
-      return json(res, 200, { ok: true, token: token, userId: profile.id, role: profile.role, directLogin: true })
-    }
-    throw e
-  }
+  const network = ip(req), name = String(b.name || '').trim().slice(0, 100), p = phone(b.phone), e = email(b.email), pass = String(b.pass || ''), role = b.role === 'provider' ? 'provider' : 'customer', fp = String(b.deviceId || '')
+  const serviceIds = Array.isArray(b.serviceIds) ? b.serviceIds.map(String).slice(0, 3) : []
+  if (name.length < 2 || !/^07\d{9}$/.test(p) || !emailOk(e) || pass.length < 8 || !deviceOk(fp) || role === 'provider' && !serviceIds.length) fail(400, 'bad_body')
+  if (!(await verifyTurnstile(b.turnstileToken, network))) fail(403, 'human_check_failed')
+  const byPhone = await dal.find(T.profiles, { phone: p }), byEmail = await dal.find(T.profiles, { email: e })
+  if (byEmail && (!byPhone || byEmail.id !== byPhone.id)) fail(409, 'email_taken')
+  if (byPhone && (email(byPhone.email) !== e || byPhone.email_verified || !verifyPassword(pass, byPhone.pass_hash))) fail(409, 'phone_taken')
+  await sendOtp(e, 'register', true)
+  const reg = byPhone ? null : { name, phone: p, email: e, passHash: hashPassword(pass), role, area: String(b.area || '').slice(0, 120), serviceIds, exp: Math.max(0, Math.min(80, Number(b.exp || 0))), areas: Array.isArray(b.areas) ? b.areas.map(String).slice(0, 20) : [], ip: network }
+  const token = makePending({ p: 'register', sub: byPhone && byPhone.id || null, e, fp, label: label(b.deviceLabel, req), ip: network, reg })
+  await event('registration_otp_sent', byPhone && byPhone.id, network, { role })
+  return json(res, 200, { ok: true, needsOtp: true, pending: token, email: mask(e), purpose: 'register' })
 }
-
 async function login(res, b, req) {
-  const phone = normalizePhone(b.phone)
-  const pass = String(b.pass || '')
-  if (!PHONE_RE.test(phone) || !pass) return json(res, 400, { ok: false, error: 'bad_credentials' })
-
-  const ip = getClientIp(req)
-  const deviceId = deviceFp(req, b)
-
-  const profile = await dal.find('ur_profiles', { phone })
-  if (!profile) { await noteLoginFail(ip); return json(res, 401, { ok: false, error: 'not_registered' }) }
-  if (profile.status === 'suspended') return json(res, 403, { ok: false, error: 'suspended' })
-
-  // 👑 ميزة الإدارة: الأدمن يسجل دخول من أي جهاز مباشرة وبلا قيود وبلا كبح وبلا انتظار موافقة أو OTP
-  if (profile.role === 'admin') {
-    const ok = await verifyPassword(pass, profile.pass_hash)
-    if (!ok) { await noteLoginFail(ip); await secEvent(profile.id, 'login_bad_password', {}, ip); return json(res, 401, { ok: false, error: 'bad_credentials' }) }
-    await clearLoginFails(ip)
-    _bannedIps.delete(ip); _bannedDevices.delete(deviceId)
-    try { await rlSet('ban:ip:' + ip, 0, 0, []); await rlSet('ban:dev:' + deviceId, 0, 0, []); } catch (_) {}
-    try { await dal.update('ur_profiles', { id: profile.id }, { last_ip: ip }) } catch (_) {}
-    if (deviceId) {
-      try {
-        const known = await activeDevice(profile.id, deviceId)
-        if (!known) {
-          try { await dal.del('ur_devices', { fingerprint: deviceId }) } catch (_) {}
-          await activateDevice(profile, deviceId, req.headers['user-agent'], ip)
-        } else {
-          try { await dal.update('ur_devices', { id: known.id }, { last_seen: new Date().toISOString() }) } catch (_) {}
-        }
-      } catch (_) {}
-    }
-    const token = signToken({ sub: profile.id, role: 'admin', phone: profile.phone, dv: deviceId })
-    return json(res, 200, { ok: true, token: token, userId: profile.id, role: 'admin', needsEmail: !profile.email })
-  }
-
-  if (await isBanned(ip, deviceId)) {
-    return json(res, 403, { ok: false, error: 'device_blocked', message: '🚫 هذا الجهاز محظور من استخدام المنصة' })
-  }
-  if (!(await verifyTurnstile(String(b.turnstileToken || ''), ip))) {
-    return json(res, 403, { ok: false, error: 'turnstile_failed' })
-  }
-
-  const failCount = await loginFailCount(ip)
-  if (failCount >= 6) {
-    return json(res, 429, { ok: false, error: 'device_blocked', message: '🚫 محاولات دخول كثيرة — انتظر شوية وحاول من جديد' })
-  }
-
-  const ok = await verifyPassword(pass, profile.pass_hash)
-  if (!ok) { await noteLoginFail(ip); await secEvent(profile.id, 'login_bad_password', {}, ip); return json(res, 401, { ok: false, error: 'bad_credentials' }) }
-
-  await clearLoginFails(ip)
-  try { await dal.update('ur_profiles', { id: profile.id }, { last_ip: ip }) } catch (_) {}
-
-  // جهاز مربوط بحساب آخر؟ ممنوع — حساب واحد لكل جهاز
-  const owner = await deviceOwner(deviceId)
-  if (owner && owner.profile_id !== profile.id) {
-    await secEvent(profile.id, 'login_on_foreign_device', { owner: owner.profile_id }, ip)
-    await notifyAdmins('🚨', 'محاولة دخول لحساب ' + profile.name + ' من جهاز مربوط بحساب آخر — اشتباه مشاركة/اختراق', null)
-    return json(res, 403, { ok: false, error: 'device_in_use', message: '🚫 هذا الجهاز مربوط بحساب آخر — جهاز واحد = حساب واحد.' })
-  }
-  const known = !!(await activeDevice(profile.id, deviceId))
-
-  // v8.8 — كل حساب عنده بريد يمر بالرمز حتماً: غير المفعّل يكمّل رمز التفعيل (register)،
-  // والمسار المتساهل بالأسفل صار فقط لمن لا بريد له إطلاقاً — ماكو التفاف على OTP
-  if (profile.email) {
-    const purpose = !profile.email_verified ? 'register' : (known ? 'login' : 'device')
-    let extra = {}
-    try {
-      extra = await issueOtp(profile.email, purpose, ip)
-      const pending = signToken({ scope: 'otp', purpose: purpose, sub: profile.id, ph: phone, em: profile.email, fp: deviceId }, 0.007)
-      return json(res, 200, Object.assign({ ok: true, needsOtp: true, pending: pending, email: profile.email, newDevice: !known }, extra))
-    } catch (e) {
-      if (e.code === 'mail_not_configured' || e.code === 'mail_failed' || e.code === 'otp_limit') {
-        // إذا كان البريد معطلاً أو وصل حد سوبابيس (rate limit)، فالباسورد صحيح — يدخل بسلام
-        try { await dal.update('ur_profiles', { id: profile.id }, { email_verified: true }) } catch (_) {}
-        if (!known && deviceId) {
-          try { await dal.del('ur_devices', { fingerprint: deviceId }) } catch (_) {}
-          await activateDevice(profile, deviceId, req.headers['user-agent'], ip)
-        }
-        const token = signToken({ sub: profile.id, role: profile.role, phone: profile.phone, dv: deviceId })
-        return json(res, 200, { ok: true, token: token, userId: profile.id, role: profile.role, mailPending: true })
-      }
-      throw e
-    }
-  }
-
-  // حسابات قديمة بلا بريد مفعّل (ومنها الإدارة): دخول مباشر مع تنبيه إكمال البريد
-  if (!known) {
-    await activateDevice(profile, deviceId, req.headers['user-agent'], ip)
-    await notifyAdmins('🛡️', 'جهاز جديد فُعّل مباشرة لحساب قديم بلا بريد: ' + profile.name + ' — راجع الأجهزة', null)
-    await secEvent(profile.id, 'legacy_device_autoactivated', { fp: deviceId.slice(0, 24) }, ip)
-  } else {
-    try { await dal.update('ur_devices', { profile_id: profile.id, fingerprint: deviceId, status: 'active' }, { last_seen: new Date().toISOString() }) } catch (_) {}
-  }
-  const token = signToken({ sub: profile.id, role: profile.role, phone: profile.phone, dv: deviceId })
-  return json(res, 200, { ok: true, token: token, userId: profile.id, role: profile.role, needsEmail: !profile.email })
+  const network = ip(req), p = phone(b.phone), pass = String(b.pass || ''), fp = String(b.deviceId || '')
+  if (!/^07\d{9}$/.test(p) || !pass || !deviceOk(fp)) fail(400, 'bad_body')
+  await ensureAdmin(p)
+  const profile = await dal.find(T.profiles, { phone: p }); if (!profile) fail(401, 'invalid_credentials')
+  const state = await gate(profile.id, network); if (state.until > Date.now()) fail(429, 'login_cooldown', { retryAfter: Math.ceil((state.until - Date.now()) / 1000) })
+  if (state.count >= 3 && !(await verifyTurnstile(b.turnstileToken, network))) fail(403, 'human_check_required')
+  if (!verifyPassword(pass, profile.pass_hash)) { const count = await badLogin(profile.id, network); await event('login_bad_password', profile.id, network, { count }); fail(401, 'invalid_credentials') }
+  if (profile.status !== 'active') fail(403, 'suspended')
+  await rateClear(loginKey(profile.id, network))
+  if (!profile.email) { await trustDevice(profile, fp, b.deviceLabel, req, network, 'جلسة محدودة لحين ربط البريد'); await event('login_email_binding_required', profile.id, network, {}); return json(res, 200, { ok: true, token: session(profile, fp, true), userId: profile.id, role: profile.role, needsEmail: true, limited: true }) }
+  const known = await activeDevice(profile.id, fp), trusted = known && known.trusted_until && new Date(known.trusted_until).getTime() > Date.now()
+  if (trusted && profile.email_verified) { await updateDevice(known.id, { last_seen: new Date().toISOString(), last_ip: network, label: label(b.deviceLabel, req) }); return json(res, 200, { ok: true, token: session(profile, fp, false), userId: profile.id, role: profile.role, trustedDevice: true }) }
+  await sendOtp(profile.email, known ? 'login' : 'device', !profile.auth_user_id)
+  const token = makePending({ p: known ? 'login' : 'device', sub: profile.id, e: email(profile.email), fp, label: label(b.deviceLabel, req), ip: network })
+  await event('login_otp_sent', profile.id, network, { new_device: !known })
+  return json(res, 200, { ok: true, needsOtp: true, pending: token, email: mask(profile.email), purpose: known ? 'login' : 'device', newDevice: !known })
 }
-
-// v8.8 — ربط بريد لحساب قديم (يتطلب جلسة صالحة): يرسل رمزاً لغرض bind
-async function bindEmail(res, b, req) {
-  const token = getToken(req)
-  const payload = token && verifyToken(token)
-  if (!payload || payload.scope === 'otp') return json(res, 401, { ok: false, error: 'unauthorized' })
-  const profile = await dal.find('ur_profiles', { id: payload.sub })
-  if (!profile) return json(res, 404, { ok: false, error: 'user_not_found' })
-  if (profile.email && profile.email_verified) return json(res, 409, { ok: false, error: 'email_taken' })
-  const email = String(b.email || '').trim().toLowerCase()
-  if (!EMAIL_RE.test(email)) return json(res, 400, { ok: false, error: 'bad_email' })
-  // الربط المتقاطع ممنوع: بريد مربوط برقم آخر ما ينربط لرقمك — والعكس بالتسجيل
-  const dup = await dal.find('ur_profiles', { email: email })
-  if (dup && dup.id !== profile.id) return json(res, 409, { ok: false, error: 'email_taken' })
-  const ip = getClientIp(req)
-  const extra = await issueOtp(email, 'bind', ip)
-  const pending = signToken({ scope: 'otp', purpose: 'bind', sub: profile.id, em: email, fp: payload.dv || '' }, 0.007)
-  await secEvent(profile.id, 'bind_email_issued', {}, ip)
-  return json(res, 200, Object.assign({ ok: true, needsOtp: true, pending: pending, email: email }, extra))
+async function completeRegistrationRate(profile, fp, network) { const now = Date.now(); for (const pair of [['device', sha256(fp).slice(0, 24)], ['network', sha256(network).slice(0, 24)]]) { const key = 'registration:' + pair[0] + ':' + pair[1], old = await rateGet(key), fresh = old && now - Number(old.first || 0) < 30 * 86400000, list = fresh && Array.isArray(old.items) ? old.items.slice() : []; if (!list.includes(profile.phone)) list.push(profile.phone); await rateSet(key, list.length, fresh ? Number(old.first) : now, list.slice(-12)); const threshold = pair[0] === 'device' ? 3 : 10; if (list.length > threshold) await event('registration_pattern_review', profile.id, network, { signal: pair[0], accounts_30d: list.length }) } }
+async function verifyAction(res, b, req) {
+  const p = pending(b.pending); if (!['register', 'login', 'device', 'bind'].includes(p.p)) fail(400, 'bad_purpose')
+  const user = await verifyOtp(p, b.code)
+  let profile
+  if (p.p === 'register') profile = p.sub ? await dal.find(T.profiles, { id: p.sub }) : await createRegistration(p.reg || {})
+  else profile = await dal.find(T.profiles, { id: p.sub })
+  if (!profile) fail(404, 'not_registered')
+  if (p.p === 'bind') { const actor = verifyToken(getToken(req)); if (!actor || actor.sub !== profile.id) fail(401, 'unauthorized'); const taken = await dal.find(T.profiles, { email: email(p.e) }); if (taken && taken.id !== profile.id) fail(409, 'email_taken') }
+  profile = await linkIdentity(profile, user, p.e)
+  const d = await trustDevice(profile, p.fp, p.label, req, ip(req), p.p === 'register' ? 'أول جهاز موثوق' : 'تحقق بريد ناجح')
+  if (p.p === 'register') await completeRegistrationRate(profile, p.fp, p.ip || ip(req))
+  await event('otp_verified', profile.id, ip(req), { purpose: p.p, device_id: d && d.id })
+  return json(res, 200, { ok: true, verified: true, bound: p.p === 'bind', token: session(profile, p.fp, false), userId: profile.id, role: profile.role })
 }
-
-async function verifyOtpAction(res, b, req) {
-  const payload = verifyToken(String(b.pending || ''))
-  if (!payload || payload.scope !== 'otp') return json(res, 401, { ok: false, error: 'bad_pending' })
-  const ip = getClientIp(req)
-  const profile = await dal.find('ur_profiles', { id: payload.sub })
-  if (!profile) return json(res, 404, { ok: false, error: 'user_not_found' })
-  const email = payload.em || profile.email
-  if (!email) return json(res, 400, { ok: false, error: 'bad_pending' })
-
-  await consumeOtp(email, payload.purpose, b.code) // يرمي bad_otp
-
-  if (payload.purpose === 'register' || payload.purpose === 'login') {
-    if (payload.purpose === 'register' && !profile.email_verified) {
-      await dal.update('ur_profiles', { id: profile.id }, { email_verified: true })
-    }
-    if (payload.fp) {
-      const known = await activeDevice(profile.id, payload.fp)
-      if (!known) {
-        const actCount = await countActiveDevices(profile.id)
-        const hasEmailGate = profile.email_verified || payload.purpose === 'register'
-        if (actCount === 0 || !hasEmailGate) {
-          await activateDevice(profile, payload.fp, req.headers['user-agent'], ip)
-        } else {
-          // جهاز جديد لحساب مفعّل: يمر بريداً ثم ينتظر موافقة الإدارة (تبديل العطلان)
-          await dal.insert('ur_devices', {
-            profile_id: profile.id, fingerprint: payload.fp,
-            label: String(req.headers['user-agent'] || '').slice(0, 80),
-            status: 'pending', created_at: new Date().toISOString(), last_seen: new Date().toISOString(),
-            note: 'بانتظار موافقة الإدارة (تبديل جهاز)',
-          })
-          await notifyAdmins('🛡️', 'طلب تبديل جهاز: ' + profile.name + ' (' + profile.phone + ') — راجع تبويب الأمان لاعتماد الجهاز الجديد وإلغاء القديم', null)
-          await secEvent(profile.id, 'device_pending_approval', { fp: payload.fp.slice(0, 24) }, ip)
-          return json(res, 200, { ok: true, needsDeviceApproval: true, message: '🛡️ جهازك الجديد سجّلناه وينتظر موافقة الإدارة — تصلك الموافقة قريباً ومن بعدها تسجّل دخولك بأمان.' })
-        }
-      } else {
-        try { await dal.update('ur_devices', { id: known.id }, { last_seen: new Date().toISOString() }) } catch (_) {}
-      }
-    }
-    await secEvent(profile.id, payload.purpose === 'register' ? 'register_verified' : 'login_verified', {}, ip)
-    const token = signToken({ sub: profile.id, role: profile.role, phone: profile.phone, dv: payload.fp || '' })
-    return json(res, 200, { ok: true, token: token, userId: profile.id, role: profile.role })
-  }
-
-  if (payload.purpose === 'device') {
-    // رمز البريد صحيح — الجهاز ينتظر قرار الإدارة
-    try {
-      await dal.insert('ur_devices', {
-        profile_id: profile.id, fingerprint: payload.fp || deviceFp(req, b),
-        label: String(req.headers['user-agent'] || '').slice(0, 80),
-        status: 'pending', created_at: new Date().toISOString(), last_seen: new Date().toISOString(),
-        note: 'بانتظار موافقة الإدارة (تبديل جهاز)',
-      })
-    } catch (e) {
-      if (String((e && e.message) || '').indexOf('duplicate') < 0) throw e
-    }
-    await notifyAdmins('🛡️', 'طلب تبديل جهاز: ' + profile.name + ' (' + profile.phone + ') — راجع تبويب الأمان', null)
-    await secEvent(profile.id, 'device_pending_approval', {}, ip)
-    return json(res, 200, { ok: true, needsDeviceApproval: true, message: '🛡️ جهازك الجديد ينتظر موافقة الإدارة.' })
-  }
-
-  if (payload.purpose === 'bind') {
-    const dup = await dal.find('ur_profiles', { email: email })
-    if (dup && dup.id !== profile.id) return json(res, 409, { ok: false, error: 'email_taken' })
-    await dal.update('ur_profiles', { id: profile.id }, { email: email, email_verified: true })
-    await secEvent(profile.id, 'email_bound', {}, ip)
-    return json(res, 200, { ok: true, bound: true, email: email })
-  }
-
-  return json(res, 400, { ok: false, error: 'bad_pending' })
-}
-
-// ------------------------------------------------------------ نسيت كلمة المرور / إعادة التعيين (OTP)
-async function forgotPassword(res, b, req) {
-  const phone = normalizePhone(b.phone)
-  if (!PHONE_RE.test(phone)) return json(res, 400, { ok: false, error: 'bad_phone' })
-
-  const ip = getClientIp(req)
-  if (!(await verifyTurnstile(String(b.turnstileToken || ''), ip))) {
-    return json(res, 403, { ok: false, error: 'turnstile_failed' })
-  }
-
-  const profile = await dal.find('ur_profiles', { phone })
-  if (!profile) return json(res, 404, { ok: false, error: 'not_registered', message: '⚠️ هذا الرقم غير مسجّل لدينا' })
-  if (profile.status === 'suspended') return json(res, 403, { ok: false, error: 'suspended' })
-  if (!profile.email) {
-    return json(res, 400, { ok: false, error: 'no_email', message: '⚠️ هذا الحساب غير مربوط ببريد إلكتروني — تواصل مع الإدارة للمساعدة' })
-  }
-
-  let extra = {}
-  try {
-    extra = await issueOtp(profile.email, 'reset', ip)
-  } catch (e) {
-    if (e.code === 'mail_not_configured' || e.code === 'mail_failed') {
-      return json(res, 503, { ok: false, error: 'mail_not_configured', message: '📧 خدمة إرسال الرموز غير متاحة حالياً' })
-    }
-    throw e
-  }
-
-  const parts = profile.email.split('@')
-  const maskedEmail = (parts[0].length <= 2 ? parts[0][0] + '*' : parts[0][0] + '***' + parts[0].slice(-1)) + '@' + (parts[1] || '')
-
-  const deviceId = deviceFp(req, b)
-  const pending = signToken({ scope: 'otp', purpose: 'reset', sub: profile.id, ph: phone, em: profile.email, fp: deviceId }, 0.007)
-  await secEvent(profile.id, 'forgot_password_requested', {}, ip)
-  return json(res, 200, Object.assign({ ok: true, needsOtp: true, pending: pending, email: maskedEmail }, extra))
-}
-
-async function resetPassword(res, b, req) {
-  const payload = verifyToken(String(b.pending || ''))
-  if (!payload || payload.scope !== 'otp' || payload.purpose !== 'reset') {
-    return json(res, 401, { ok: false, error: 'bad_pending' })
-  }
-  const newPass = String(b.newPass || '')
-  if (newPass.length < 6) return json(res, 400, { ok: false, error: 'bad_pass', message: '🔑 كلمة المرور يجب أن تكون 6 أحرف على الأقل' })
-
-  const ip = getClientIp(req)
-  const profile = await dal.find('ur_profiles', { id: payload.sub })
-  if (!profile) return json(res, 404, { ok: false, error: 'user_not_found' })
-  const email = payload.em || profile.email
-  if (!email) return json(res, 400, { ok: false, error: 'bad_pending' })
-
-  await consumeOtp(email, 'reset', b.code) // يرمي bad_otp
-
-  const passHash = await hashPassword(newPass)
-  await dal.update('ur_profiles', { id: profile.id }, { pass_hash: passHash, email_verified: true })
-  await clearLoginFails(ip)
-  await secEvent(profile.id, 'password_reset_success', {}, ip)
-
-  const deviceId = payload.fp || deviceFp(req, b)
-  if (deviceId) {
-    try {
-      const known = await activeDevice(profile.id, deviceId)
-      if (!known) {
-        await activateDevice(profile, deviceId, req.headers['user-agent'], ip)
-      }
-    } catch (_) {}
-  }
-  const token = signToken({ sub: profile.id, role: profile.role, phone: profile.phone, dv: deviceId })
-  return json(res, 200, { ok: true, token: token, userId: profile.id, role: profile.role, message: '🎉 تم تغيير كلمة المرور بنجاح!' })
-}
-
-async function resendOtp(res, b, req) {
-  const payload = verifyToken(String(b.pending || ''))
-  if (!payload || payload.scope !== 'otp') return json(res, 401, { ok: false, error: 'bad_pending' })
-  const ip = getClientIp(req)
-  let email = payload.em || ''
-  if (!email && payload.sub) {
-    const profile = await dal.find('ur_profiles', { id: payload.sub })
-    email = profile && profile.email || ''
-  }
-  if (!email) return json(res, 400, { ok: false, error: 'bad_pending' })
-  const extra = await issueOtp(email, payload.purpose, ip) // يرمي otp_wait / otp_limit
-  return json(res, 200, Object.assign({ ok: true, needsOtp: true, pending: b.pending, email: email }, extra))
-}
-
-async function me(req, res) {
-  const token = getToken(req)
-  if (!token) return json(res, 401, { ok: false, error: 'unauthorized' })
-  const payload = verifyToken(token)
-  if (!payload) return json(res, 401, { ok: false, error: 'bad_token' })
-
-  const profile = await dal.find('ur_profiles', { id: payload.sub })
-  if (!profile) return json(res, 404, { ok: false, error: 'user_not_found' })
-
-  let provider = null
-  if (profile.role === 'provider') {
-    provider = await dal.find('ur_providers', { profile_id: profile.id })
-  }
-
-  // أجهزتي — المستخدم يشوف أجهزة حسابه (والإدارة تشوف الكل من السنابشوت)
-  let devices = []
-  try {
-    devices = (await dal.all('ur_devices', { profile_id: profile.id }))
-      .map((d) => ({ id: d.id, label: d.label, status: d.status, at: new Date(d.created_at).getTime(), lastSeen: new Date(d.last_seen).getTime() }))
-      .sort((a, b2) => b2.lastSeen - a.lastSeen)
-  } catch (_) {}
-
-  const safeUser = Object.assign({}, profile)
-  delete safeUser.pass_hash
-  delete safeUser.devices
-  safeUser.devicesList = devices
-  return json(res, 200, { ok: true, user: safeUser, provider })
-}
-
-// ------------------------------------------------------------ تأكيد البريد وتعيين كلمة المرور عبر رابط سوبابيس المباشر
-async function confirmEmailToken(res, b, req) {
-  const email = String(b.email || '').trim().toLowerCase()
-  if (!EMAIL_RE.test(email)) return json(res, 400, { ok: false, error: 'bad_email' })
-
-  const profile = await dal.find('ur_profiles', { email: email })
-  if (!profile) return json(res, 404, { ok: false, error: 'user_not_found' })
-
-  await dal.update('ur_profiles', { id: profile.id }, { email_verified: true })
-
-  const ip = getClientIp(req)
-  const deviceId = deviceFp(req, b)
-  if (deviceId) {
-    try {
-      const known = await activeDevice(profile.id, deviceId)
-      if (!known) {
-        await activateDevice(profile, deviceId, req.headers['user-agent'], ip)
-      }
-    } catch (_) {}
-  }
-  await secEvent(profile.id, 'email_confirmed_via_link', {}, ip)
-  const token = signToken({ sub: profile.id, role: profile.role, phone: profile.phone, dv: deviceId })
-  return json(res, 200, { ok: true, token: token, userId: profile.id, role: profile.role, message: '🎉 تم تأكيد البريد بنجاح' })
-}
-
-async function directResetPassword(res, b, req) {
-  const email = String(b.email || '').trim().toLowerCase()
-  const newPass = String(b.newPass || '')
-  if (!EMAIL_RE.test(email)) return json(res, 400, { ok: false, error: 'bad_email' })
-  if (newPass.length < 6) return json(res, 400, { ok: false, error: 'bad_pass', message: '🔑 كلمة المرور يجب أن تكون 6 أحرف على الأقل' })
-
-  const profile = await dal.find('ur_profiles', { email: email })
-  if (!profile) return json(res, 404, { ok: false, error: 'user_not_found' })
-
-  const passHash = await hashPassword(newPass)
-  await dal.update('ur_profiles', { id: profile.id }, { pass_hash: passHash, email_verified: true })
-
-  const ip = getClientIp(req)
-  const deviceId = deviceFp(req, b)
-  if (deviceId) {
-    try {
-      const known = await activeDevice(profile.id, deviceId)
-      if (!known) {
-        await activateDevice(profile, deviceId, req.headers['user-agent'], ip)
-      }
-    } catch (_) {}
-  }
-  await clearLoginFails(ip)
-  await secEvent(profile.id, 'password_reset_via_link', {}, ip)
-  const token = signToken({ sub: profile.id, role: profile.role, phone: profile.phone, dv: deviceId })
-  return json(res, 200, { ok: true, token: token, userId: profile.id, role: profile.role, message: '🎉 تم تعيين كلمة المرور الجديدة بنجاح!' })
+async function resend(res, b) { const p = pending(b.pending); if (!['register', 'login', 'device', 'bind', 'reset'].includes(p.p)) fail(400, 'bad_purpose'); const profile = p.sub ? await dal.find(T.profiles, { id: p.sub }) : null; await sendOtp(p.e, p.p, p.p === 'register' || p.p === 'bind' || !(profile && profile.auth_user_id)); const next = makePending({ p: p.p, sub: p.sub || null, e: p.e, fp: p.fp, label: p.label, ip: p.ip, reg: p.reg || null }); return json(res, 200, { ok: true, pending: next, email: mask(p.e), purpose: p.p }) }
+async function bind(res, b, req) { const actor = verifyToken(getToken(req)); if (!actor) fail(401, 'unauthorized'); const profile = await dal.find(T.profiles, { id: actor.sub }); if (!profile) fail(401, 'unauthorized'); const e = email(b.email); if (!emailOk(e)) fail(400, 'bad_email'); const taken = await dal.find(T.profiles, { email: e }); if (taken && taken.id !== profile.id) fail(409, 'email_taken'); await sendOtp(e, 'bind', true); const fp = String(actor.dv || b.deviceId || ''); if (!deviceOk(fp)) fail(400, 'bad_device'); return json(res, 200, { ok: true, needsOtp: true, pending: makePending({ p: 'bind', sub: profile.id, e, fp, label: label(b.deviceLabel, req), ip: ip(req) }), email: mask(e), purpose: 'bind' }) }
+async function forgot(res, b, req) { const p = phone(b.phone), fp = String(b.deviceId || ''); if (!/^07\d{9}$/.test(p) || !deviceOk(fp)) fail(400, 'bad_body'); const profile = await dal.find(T.profiles, { phone: p }); if (!profile || !profile.email) fail(404, 'reset_unavailable'); await sendOtp(profile.email, 'reset', !profile.auth_user_id); await event('password_reset_otp_sent', profile.id, ip(req), {}); return json(res, 200, { ok: true, needsOtp: true, pending: makePending({ p: 'reset', sub: profile.id, e: email(profile.email), fp, label: label(b.deviceLabel, req), ip: ip(req) }), email: mask(profile.email), purpose: 'reset' }) }
+async function reset(res, b, req) { const p = pending(b.pending, 'reset'), next = String(b.newPass || ''); if (next.length < 8 || next.length > 200) fail(400, 'weak_password'); const user = await verifyOtp(p, b.code); let profile = await dal.find(T.profiles, { id: p.sub }); if (!profile) fail(404, 'not_registered'); profile = await linkIdentity(profile, user, p.e); await dal.update(T.profiles, { id: profile.id }, { pass_hash: hashPassword(next) }); for (const d of await devices(profile.id)) if (d.status === 'active' && d.fingerprint !== p.fp) await updateDevice(d.id, { status: 'revoked', note: 'تغيير كلمة المرور', revoked_at: new Date().toISOString(), revoked_reason: 'password_reset' }); await trustDevice(profile, p.fp, p.label, req, ip(req), 'إعادة تعيين آمنة'); await event('password_reset_completed', profile.id, ip(req), {}); return json(res, 200, { ok: true, token: session(profile, p.fp, false), userId: profile.id, role: profile.role }) }
+async function me(res, req) { const actor = verifyToken(getToken(req)); if (!actor) fail(401, 'unauthorized'); const profile = await dal.find(T.profiles, { id: actor.sub }); if (!profile) fail(401, 'unauthorized'); const list = (await devices(profile.id)).map((d) => ({ id: d.id, label: d.label, status: d.status, created_at: d.created_at, last_seen: d.last_seen, trusted_until: d.trusted_until || null, current: d.fingerprint === actor.dv })); return json(res, 200, { ok: true, user: safeProfile(profile), devices: list }) }
+async function revoke(res, b, req) { const actor = verifyToken(getToken(req)); if (!actor) fail(401, 'unauthorized'); const d = await dal.find(T.devices, { id: b.deviceId }); if (!d || d.profile_id !== actor.sub) fail(404, 'device_not_found'); await updateDevice(d.id, { status: 'revoked', note: 'ألغاه صاحب الحساب', revoked_at: new Date().toISOString(), revoked_reason: 'self_service' }); await event('device_self_revoked', actor.sub, ip(req), { device_id: d.id }); return json(res, 200, { ok: true, logout: d.fingerprint === actor.dv }) }
+module.exports = async function handler(req, res) {
+  cors(res); if (req.method === 'OPTIONS') { res.statusCode = 204; return res.end() }; if (req.method !== 'POST') return json(res, 405, { ok: false, error: 'method_not_allowed' }); if (!cloudReady) return json(res, 503, { ok: false, error: 'cloud_not_configured' })
+  try { const b = await readBody(req), a = String(b.action || ''); if (a === 'register') return await register(res, b, req); if (a === 'login') return await login(res, b, req); if (a === 'verifyOtp') return await verifyAction(res, b, req); if (a === 'resendOtp') return await resend(res, b); if (a === 'bindEmail') return await bind(res, b, req); if (a === 'forgotPassword') return await forgot(res, b, req); if (a === 'resetPassword') return await reset(res, b, req); if (a === 'me') return await me(res, req); if (a === 'revokeMyDevice') return await revoke(res, b, req); return json(res, 400, { ok: false, error: 'bad_action' }) }
+  catch (e) { const out = { ok: false, error: e.code || e.message || 'server_error' }; if (e.retryAfter) out.retryAfter = e.retryAfter; return json(res, e.status || 500, out) }
 }
