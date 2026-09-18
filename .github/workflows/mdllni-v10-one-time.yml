@@ -1,33 +1,11 @@
-name: mdllni v10 direct-runner diagnostics
+name: mdllni runner ping
 on:
   push:
     branches: [v10-identity-hardening]
     paths: [.github/workflows/mdllni-v10-one-time.yml]
-permissions:
-  contents: write
 jobs:
-  diagnose:
+  ping:
     runs-on: ubuntu-latest
     steps:
-      - name: Clone, check, and save result
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          git clone --branch "$GITHUB_REF_NAME" "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" repo
-          cd repo
-          set +e
-          {
-            echo "== syntax =="
-            for f in api/_lib.js api/auth.js api/data.js api/health.js js/app.js js/cloud.js js/cloud-patch.js; do echo "-- $f"; node --check "$f"; done
-            echo "== tests =="
-            npm test
-          } > ci-v10.log 2>&1
-          status=$?
-          echo "exit_status=$status" >> ci-v10.log
-          cat ci-v10.log
-          git config user.name mdllni-ci
-          git config user.email ci@mdllni.app
-          git add ci-v10.log
-          git commit -m "test(v10): record direct-runner results" || true
-          git push origin HEAD:"$GITHUB_REF_NAME"
-          exit 0
+      - name: Ping
+        run: echo mdllni-runner-ok
