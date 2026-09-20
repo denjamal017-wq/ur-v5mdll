@@ -11,13 +11,16 @@ jobs:
   harden:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - name: Apply and verify hardening
+      - name: Checkout, harden, test, and commit
         shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set +e
+          git clone --branch v11-complete-hardening --single-branch "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git" repo
+          code=$?
+          if [ "$code" -ne 0 ]; then exit "$code"; fi
+          cd repo
           : > hardening.log
           node scripts/mdllni-hardening.js >> hardening.log 2>&1
           code=$?
@@ -34,11 +37,11 @@ jobs:
             cp /tmp/hardening.log hardening.log
             git add hardening.log
             git commit -m "test(security): capture v11 hardening failure" || true
-            git push || true
+            git push origin HEAD:v11-complete-hardening || true
             exit "$code"
           fi
           rm -f scripts/mdllni-hardening.js .github/workflows/mdllni-v11-hardening.yml hardening.log
           git add -A
           git diff --cached --check
           git commit -m "security(v11): harden identity sessions finance and fraud controls"
-          git push
+          git push origin HEAD:v11-complete-hardening
