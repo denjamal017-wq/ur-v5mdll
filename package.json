@@ -1,9 +1,9 @@
 {
   "name": "mdllni",
-  "version": "10.0.0",
+  "version": "11.0.0",
   "private": true,
   "description": "مدللني — منصة خدمات الناصرية الآمنة",
   "type": "commonjs",
   "engines": { "node": ">=18" },
-  "scripts": { "test": "node test/security-v10.js" }
+  "scripts": { "test": "node test/security-v11.js" }
 }
