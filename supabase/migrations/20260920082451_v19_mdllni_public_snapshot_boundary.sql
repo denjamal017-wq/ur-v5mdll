@@ -1,0 +1,15 @@
+-- v19 — dedicated, read-only public snapshot. It never loads private accounts/orders in application memory.
+create or replace function public.mdllni_public_snapshot()
+returns jsonb language sql stable security definer set search_path to '' as $$
+select jsonb_build_object(
+ 'meta',jsonb_build_object('source','cloud','version',11,'ts',(extract(epoch from clock_timestamp())*1000)::bigint),
+ 'settings',jsonb_build_object('commission',coalesce((select value from public.mdllni_settings where key='commission'),'{}'::jsonb),'thresholds',coalesce((select value from public.mdllni_settings where key='thresholds'),'{}'::jsonb),'debt',coalesce((select value from public.mdllni_settings where key='debt'),'{}'::jsonb),'areas',coalesce((select value from public.mdllni_settings where key='areas'),'[]'::jsonb)),
+ 'cats',coalesce((select jsonb_agg(jsonb_build_object('id',id,'name',name,'icon',icon,'sort',sort)order by sort)from public.mdllni_categories),'[]'::jsonb),
+ 'services',coalesce((select jsonb_agg(jsonb_build_object('id',id,'icon',icon,'name',name,'cat',cat,'min',min_price,'max',max_price,'unit',unit,'popular',popular,'wave',wave,'active',active,'sensitive',sensitive,'gold',gold,'description',description,'createdAt',(extract(epoch from created_at)*1000)::bigint)order by id)from public.mdllni_services where active),'[]'::jsonb),
+ 'users',coalesce((select jsonb_agg(jsonb_build_object('id',p.id,'role','provider','name',p.name,'phone','','area',p.area,'status',p.status,'createdAt',(extract(epoch from p.created_at)*1000)::bigint,'provider',jsonb_build_object('serviceId',pr.service_id,'serviceIds',pr.service_ids,'exp',pr.exp,'areas',pr.areas,'verified',pr.verified,'avail',pr.avail,'ratingSum',pr.rating_sum,'ratingCount',pr.rating_count,'jobs',pr.jobs,'sensitive',pr.sensitive,'respSum',pr.resp_sum,'respCount',pr.resp_count,'dropCount',pr.drop_count))order by p.name)from public.mdllni_profiles p join public.mdllni_providers pr on pr.profile_id=p.id where p.status='active'and pr.verified='verified'),'[]'::jsonb),
+ 'session',null,'orders','[]'::jsonb,'messages','[]'::jsonb,'notes','[]'::jsonb,'tickets','[]'::jsonb,'ticketMessages','[]'::jsonb,'payouts','[]'::jsonb,'audit','[]'::jsonb,'ledger','[]'::jsonb,'security','[]'::jsonb,'devices','[]'::jsonb,
+ 'stats',jsonb_build_object('verifiedProvs',(select count(*)from public.mdllni_profiles p join public.mdllni_providers pr on pr.profile_id=p.id where p.status='active'and pr.verified='verified'),'doneOrders',(select count(*)from public.mdllni_orders where status='done'),'avgR',(select round(avg(stars)::numeric,1)from public.mdllni_reviews),'reviews',coalesce((select jsonb_agg(x.item order by x.created_at desc)from(select jsonb_build_object('orderId',r.order_id,'stars',r.stars,'body',r.body,'createdAt',(extract(epoch from r.created_at)*1000)::bigint)item,r.created_at from public.mdllni_reviews r order by r.created_at desc limit 20)x),'[]'::jsonb))
+);
+$$;
+revoke all on function public.mdllni_public_snapshot()from public,anon,authenticated;
+grant execute on function public.mdllni_public_snapshot()to service_role;
