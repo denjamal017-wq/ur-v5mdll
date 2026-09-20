@@ -1,10 +1,4 @@
-// GET /api/health — فحص نموذج الهوية والاتصال.
+// GET /api/health — فحص جاهزية مدللني v11 بلا كشف أسرار.
 'use strict'
-const { cloudReady, cors, ENV } = require('./_lib')
-module.exports = function handler(req, res) {
-  cors(res)
-  if (req.method === 'OPTIONS') { res.statusCode = 204; return res.end() }
-  res.setHeader('Content-Type', 'application/json; charset=utf-8')
-  res.statusCode = 200
-  res.end(JSON.stringify({ ok: true, mode: cloudReady ? 'cloud' : 'local', service: 'mdllni', version: 'v10', authProvider: 'supabase-email-otp', otpReady: !!(ENV.SUPABASE_URL && (ENV.PUBLISHABLE_KEY || ENV.SERVICE_KEY)), adaptiveDevices: true, turnstileSiteKey: ENV.TURNSTILE_SITE_KEY || '', time: new Date().toISOString() }))
-}
+const { cloudReady, ENV } = require('./_lib')
+module.exports=function handler(req,res){const origin=String(req.headers.origin||''),allowed=String(process.env.APP_ORIGINS||'').split(',').map(x=>x.trim()).filter(Boolean);if(origin&&allowed.includes(origin))res.setHeader('Access-Control-Allow-Origin',origin);res.setHeader('Vary','Origin');res.setHeader('Access-Control-Allow-Methods','GET,OPTIONS');res.setHeader('Access-Control-Allow-Headers','Content-Type, Authorization');res.setHeader('Cache-Control','no-store');if(req.method==='OPTIONS'){res.statusCode=origin&&!allowed.includes(origin)?403:204;return res.end()}if(req.method!=='GET'){res.statusCode=405;return res.end(JSON.stringify({ok:false,error:'method_not_allowed'}))}const ready=!!(cloudReady&&ENV.PUBLISHABLE_KEY);res.setHeader('Content-Type','application/json; charset=utf-8');res.statusCode=ready?200:503;res.end(JSON.stringify({ok:ready,mode:ready?'cloud':'unavailable',service:'mdllni',version:'v11',authProvider:'supabase-email-otp',otpReady:!!(ENV.SUPABASE_URL&&ENV.PUBLISHABLE_KEY),adaptiveDevices:true,sessionTrustEnforced:true,atomicFinancials:true,turnstileSiteKey:ENV.TURNSTILE_SITE_KEY||'',time:new Date().toISOString()}))}
